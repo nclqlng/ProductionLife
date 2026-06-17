@@ -364,7 +364,7 @@ def _nbo_key(name):
         key = key.replace(suffix, "")
     return key.strip()
 
-def _build_record(row, name, territory, report_type):
+def _build_record(row, name, territory, report_type, target_col=None, pct_col=None):
     """Build one NBO record from PER NBO column positions."""
     record = {
         "Territory": territory,
@@ -378,9 +378,14 @@ def _build_record(row, name, territory, report_type):
         "SSP": clean_number(row.iloc[METRIC_COLUMNS["SSP"]]) if len(row) > METRIC_COLUMNS["SSP"] else 0,
         "SSP_PY": 0,
     }
-    if report_type == "YTD" and len(row) > METRIC_COLUMNS["Pct_Target"]:
-        record["Target"] = clean_number(row.iloc[METRIC_COLUMNS["Target"]])
-        record["Pct_Target"] = _normalize_pct_target(row.iloc[METRIC_COLUMNS["Pct_Target"]])
+    # YTD only: cols N (Annual Life AC Target) and O (% to target) from header row 2
+    if report_type == "YTD":
+        t_col = target_col if target_col is not None else METRIC_COLUMNS["Target"]
+        p_col = pct_col if pct_col is not None else METRIC_COLUMNS["Pct_Target"]
+        if len(row) > t_col:
+            record["Target"] = clean_number(row.iloc[t_col])
+        if len(row) > p_col:
+            record["Pct_Target"] = _parse_pct_target(row.iloc[p_col])
     return record
 
 def _load_sheet2_lookup(file):
@@ -415,26 +420,42 @@ def _load_sheet2_lookup(file):
             "NSC": clean_number(row.iloc[cols["NSC"]]),
             "SSP": clean_number(row.iloc[cols["SSP"]]) if len(row) > cols["SSP"] else 0,
         }
+        if len(row) > 11:
+            tgt = clean_number(row.iloc[11])
+            if tgt > 0:
+                lookup[_nbo_key(name)]["Target"] = tgt
+        if len(row) > 12:
+            pct = _parse_pct_target(row.iloc[12])
+            if pct > 0:
+                lookup[_nbo_key(name)]["Pct_Target"] = pct
     return lookup
 
-def _supplement_current_metrics(record, sheet2_lookup, source_lookup):
-    """Fill blank current-period cells from Sheet2 or SOURCE."""
-    if record["AC"] > 0 or record["Lives"] > 0:
-        return record
-
+def _supplement_record(record, sheet2_lookup, source_lookup, report_type):
+    """Fill blank metrics and YTD target from Sheet2 / SOURCE (e.g. CENTURION row 96)."""
     key = _nbo_key(record["NBO"])
-    if key in sheet2_lookup:
-        src = sheet2_lookup[key]
-    elif record["NBO"].upper() in source_lookup:
-        src = source_lookup[record["NBO"].upper()]
-    else:
-        return record
 
-    record["Lives"] = src.get("Lives", record["Lives"])
-    record["AC"] = src.get("AC", record["AC"])
-    record["NSC"] = src.get("NSC", record["NSC"])
-    if record.get("SSP", 0) == 0 and src.get("SSP"):
-        record["SSP"] = src["SSP"]
+    if record["AC"] == 0 and record["Lives"] == 0:
+        if key in sheet2_lookup:
+            src = sheet2_lookup[key]
+        elif record["NBO"].upper() in source_lookup:
+            src = source_lookup[record["NBO"].upper()]
+        else:
+            src = None
+        if src:
+            record["Lives"] = src.get("Lives", record["Lives"])
+            record["AC"] = src.get("AC", record["AC"])
+            record["NSC"] = src.get("NSC", record["NSC"])
+            if record.get("SSP", 0) == 0 and src.get("SSP"):
+                record["SSP"] = src["SSP"]
+
+    if report_type == "YTD":
+        s2 = sheet2_lookup.get(key, {})
+        if clean_number(record.get("Pct_Target", 0)) == 0 and clean_number(s2.get("Pct_Target", 0)) > 0:
+            if clean_number(record.get("Target", 0)) == 0:
+                record["Target"] = clean_number(s2.get("Target", 0))
+            record["Pct_Target"] = clean_number(s2["Pct_Target"])
+        elif clean_number(record.get("Target", 0)) == 0 and clean_number(s2.get("Target", 0)) > 0:
+            record["Target"] = clean_number(s2["Target"])
     return record
 
 def _load_source_mtd_lookup(file):
@@ -465,12 +486,34 @@ def _load_source_mtd_lookup(file):
     return lookup
 
 def _apply_source_mtd_fallback(rows, lookup):
-    """Legacy wrapper — prefer _supplement_current_metrics per row."""
     for record in rows:
-        _supplement_current_metrics(record, {}, lookup)
+        _supplement_record(record, {}, lookup, "MTD")
     return rows
 
-def _normalize_pct_target(value):
+def _detect_ytd_target_columns(raw):
+    """
+    Find Annual Life AC Target and % to target from header row 2 (cols N & O).
+    Returns (target_col, pct_col) or (None, None) if this is not a YTD file.
+    """
+    target_col = pct_col = None
+    # Prefer Excel row 2 (index 1), then row 1 (index 0)
+    for hi in (1, 0, 2):
+        if hi >= len(raw):
+            continue
+        for j, val in enumerate(raw.iloc[hi]):
+            if pd.isna(val):
+                continue
+            text = str(val).upper().replace("\n", " ")
+            if "ANNUAL" in text and "LIFE AC" in text and "TARGET" in text:
+                target_col = j
+            elif "% TO TARGET" in text or (text.strip().startswith("%") and "TARGET" in text):
+                pct_col = j
+        if target_col is not None and pct_col is not None:
+            return target_col, pct_col
+    return None, None
+
+def _parse_pct_target(value):
+    """Parse % to target from column O — decimal (0.43) or whole number (43)."""
     pct = clean_number(value)
     if pct <= 0:
         return 0
@@ -504,13 +547,17 @@ def enrich_dataframe(df, report_type):
     return df
 
 @st.cache_data
-def load_production_report(file, report_type, _parser_version=8):
-    """Load YTD or MTD from PER NBO (same layout). YTD adds target cols N-O."""
+def load_production_report(file, report_type, _parser_version=10):
+    """Load YTD or MTD from PER NBO (same layout). YTD adds target cols N-O from row 2 headers."""
     try:
         raw = pd.read_excel(file, sheet_name="PER NBO", header=None)
     except Exception as e:
         st.error(f"Error loading {report_type} file: {e}")
         return pd.DataFrame()
+
+    target_col, pct_col = (None, None)
+    if report_type == "YTD":
+        target_col, pct_col = _detect_ytd_target_columns(raw)
 
     sheet2_lookup = _load_sheet2_lookup(file)
     source_lookup = _load_source_mtd_lookup(file)
@@ -529,8 +576,8 @@ def load_production_report(file, report_type, _parser_version=8):
             territory = name
             continue
 
-        record = _build_record(row, name, territory, report_type)
-        record = _supplement_current_metrics(record, sheet2_lookup, source_lookup)
+        record = _build_record(row, name, territory, report_type, target_col, pct_col)
+        record = _supplement_record(record, sheet2_lookup, source_lookup, report_type)
         rows.append(record)
 
     if not rows:
@@ -581,12 +628,12 @@ def get_period_labels(data_source):
     }
 
 @st.cache_data
-def load_ytd_report(file):
-    return load_production_report(file, "YTD")
+def load_ytd_report(file, _parser_version=10):
+    return load_production_report(file, "YTD", _parser_version=_parser_version)
 
 @st.cache_data
-def load_mtd_report(file):
-    return load_production_report(file, "MTD")
+def load_mtd_report(file, _parser_version=10):
+    return load_production_report(file, "MTD", _parser_version=_parser_version)
 
 # ============================================================================
 # CALCULATION ENGINE
@@ -901,7 +948,7 @@ def render_executive_overview(row, df, health_score, verdict, data_source):
         pct_rank = 100 - (row['AC_Rank']/df.shape[0]*100) if df.shape[0] > 0 else 0
         st.metric("AC Rank", f"#{row['AC_Rank']} of {df.shape[0]}", delta=f"Top {pct_rank:.0f}% {labels['rank_context']}")
     with col6:
-        if has_target_data(row):
+        if data_source == "YTD" and has_target_data(row):
             target_pct = clean_number(row.get("Pct_Target", 0))
             st.metric("Target Attainment", f"{target_pct:.1f}%", delta="On Track" if target_pct > 80 else "Needs Attention" if target_pct > 50 else "Behind Target")
         else:
