@@ -255,7 +255,9 @@ def clean_number(x):
     return 0
 
 def safe_divide(a, b):
-    if b == 0:
+    if b is None or pd.isna(b) or b == 0:
+        return 0
+    if a is None or pd.isna(a):
         return 0
     return a / b
 
@@ -282,138 +284,309 @@ def render_icon(icon_name, size="md", color="gold"):
     size_class = {"sm": "icon-sm", "md": "icon-md", "lg": "icon-lg", "xl": "icon-xl"}.get(size, "icon-md")
     return f'<span class="material-icons {size_class} {color_class}">{icon_name}</span>'
 
+def render_callout(title, body, style="info"):
+    """Styled message box — avoids raw HTML tags showing in Streamlit widgets."""
+    cls = {"success": "alert-success", "warning": "alert-warning", "danger": "alert-danger"}.get(style, "insight-box")
+    icon = {"success": "check_circle", "warning": "warning", "danger": "error"}.get(style, "info")
+    color = {"success": "success", "warning": "warning", "danger": "danger"}.get(style, "info")
+    st.markdown(f"""
+    <div class="alert-box {cls}">
+        <div class="alert-icon">{render_icon(icon, size='md', color=color)}</div>
+        <div class="alert-content">
+            <div class="alert-title">{title}</div>
+            <div class="alert-description">{body}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
 
-@st.cache_data
-def load_ytd_report(file):
+# PER NBO sheet — same layout for YTD and MTD files
+# Col A (0): Full NBO name | Col B (1): Broker code (numeric, NOT a name)
+# Col C (2): Short NBO label | Col D-F (3-5): Current period Lives, AC, NSC
+# Col G-I (6-8): Prior-year same period Lives, AC, NSC | Col M (12): SSP
+# YTD only — Col N (13): 2026 Annual Life AC Target | Col O (14): % to target
+# Sheet2 tab holds current-period values when PER NBO cols D-F are blank
+
+NAME_COLUMNS = (0, 2)
+METRIC_COLUMNS = {
+    "Lives": 3, "AC": 4, "NSC": 5,
+    "Lives_PY": 6, "AC_PY": 7, "NSC_PY": 8,
+    "SSP": 12,
+    "Target": 13, "Pct_Target": 14,
+}
+SHEET2_COLUMNS = {
+    "Lives": 1, "AC": 2, "NSC": 3,
+    "Lives_PY": 4, "AC_PY": 5, "NSC_PY": 6,
+    "SSP": 10,
+}
+HEADER_ROWS = 3
+
+def _looks_like_nbo_name(value):
+    """True if the cell value looks like an NBO office name, not a metric or row index."""
+    if pd.isna(value) or isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    name = str(value).strip()
+    if len(name) < 3 or not any(c.isalpha() for c in name):
+        return False
+    upper = name.upper()
+    if upper in ("NBO", "AC", "NSC", "LIVES", "SUBMITTED LIVES"):
+        return False
+    if upper.startswith(("SINGLE PAY", "NBO NAME", "TOTAL", "DECEMBER", "TERRITORY", "METRO NORTH")):
+        return False
     try:
-        raw = pd.read_excel(file, sheet_name="PER NBO", header=None)
-    except Exception as e:
-        st.error(f"Error loading YTD file: {e}")
-        return pd.DataFrame()
+        float(name.replace(",", "").replace("₱", ""))
+        return False
+    except ValueError:
+        return True
 
-    rows = []
-    territory = None
-    
-    for idx, row in raw.iterrows():
-        if len(row) < 10:
+def _is_centurion_name(name):
+    return "CENTURION" in str(name).upper()
+
+def _parse_nbo_name(row):
+    """Read NBO name from column A, fallback column C. Column B is always broker code."""
+    for col in NAME_COLUMNS:
+        if len(row) > col and _looks_like_nbo_name(row.iloc[col]):
+            return str(row.iloc[col]).strip()
+    for col in range(min(8, len(row))):
+        if pd.isna(row.iloc[col]):
             continue
-            
-        name = row.iloc[0] if len(row) > 0 else None
-        if pd.isna(name):
+        text = str(row.iloc[col]).strip()
+        if _is_centurion_name(text):
+            return text
+    return None
+
+def _nbo_key(name):
+    key = str(name).upper().strip()
+    for suffix in (" NEW BUSINESS OFFICE", " NBO", " OFFICE"):
+        key = key.replace(suffix, "")
+    return key.strip()
+
+def _build_record(row, name, territory, report_type):
+    """Build one NBO record from PER NBO column positions."""
+    record = {
+        "Territory": territory,
+        "NBO": name,
+        "Lives": clean_number(row.iloc[METRIC_COLUMNS["Lives"]]) if len(row) > METRIC_COLUMNS["Lives"] else 0,
+        "AC": clean_number(row.iloc[METRIC_COLUMNS["AC"]]) if len(row) > METRIC_COLUMNS["AC"] else 0,
+        "NSC": clean_number(row.iloc[METRIC_COLUMNS["NSC"]]) if len(row) > METRIC_COLUMNS["NSC"] else 0,
+        "Lives_PY": clean_number(row.iloc[METRIC_COLUMNS["Lives_PY"]]) if len(row) > METRIC_COLUMNS["Lives_PY"] else 0,
+        "AC_PY": clean_number(row.iloc[METRIC_COLUMNS["AC_PY"]]) if len(row) > METRIC_COLUMNS["AC_PY"] else 0,
+        "NSC_PY": clean_number(row.iloc[METRIC_COLUMNS["NSC_PY"]]) if len(row) > METRIC_COLUMNS["NSC_PY"] else 0,
+        "SSP": clean_number(row.iloc[METRIC_COLUMNS["SSP"]]) if len(row) > METRIC_COLUMNS["SSP"] else 0,
+        "SSP_PY": 0,
+    }
+    if report_type == "YTD" and len(row) > METRIC_COLUMNS["Pct_Target"]:
+        record["Target"] = clean_number(row.iloc[METRIC_COLUMNS["Target"]])
+        record["Pct_Target"] = _normalize_pct_target(row.iloc[METRIC_COLUMNS["Pct_Target"]])
+    return record
+
+def _load_sheet2_lookup(file):
+    """Sheet2 has current-period metrics when PER NBO cols D-F are blank."""
+    lookup = {}
+    try:
+        xl = pd.ExcelFile(file)
+        if "Sheet2" not in xl.sheet_names:
+            return lookup
+        raw = pd.read_excel(file, sheet_name="Sheet2", header=None)
+    except Exception:
+        return lookup
+
+    start_row = 2
+    for idx in range(min(5, len(raw))):
+        cell = str(raw.iloc[idx, 0]).strip().upper() if pd.notna(raw.iloc[idx, 0]) else ""
+        if "NBO NAME" in cell:
+            start_row = idx + 1
+            break
+
+    cols = SHEET2_COLUMNS
+    for idx in range(start_row, len(raw)):
+        row = raw.iloc[idx]
+        if len(row) < 7 or pd.isna(row.iloc[0]):
             continue
-            
-        name = str(name).strip()
-        if not name or name.startswith('DECEMBER') or name.startswith('NBO NAME') or name.startswith('TOTAL'):
+        name = str(row.iloc[0]).strip()
+        if "TERRITORY" in name.upper() or not _looks_like_nbo_name(name):
             continue
-            
-        if "TERRITORY" in name.upper():
-            territory = name
-            continue
-            
-        ac_val = clean_number(row.iloc[4]) if len(row) > 4 else 0
-        lives_val = clean_number(row.iloc[3]) if len(row) > 3 else 0
-        
-        if ac_val == 0 and lives_val == 0:
-            continue
-        
-        record = {
-            "Territory": territory,
-            "NBO": name,
-            "Lives": clean_number(row.iloc[3]) if len(row) > 3 else 0,
-            "AC": clean_number(row.iloc[4]) if len(row) > 4 else 0,
-            "NSC": clean_number(row.iloc[5]) if len(row) > 5 else 0,
-            "Lives_PY": clean_number(row.iloc[6]) if len(row) > 6 else 0,
-            "AC_PY": clean_number(row.iloc[7]) if len(row) > 7 else 0,
-            "NSC_PY": clean_number(row.iloc[8]) if len(row) > 8 else 0,
-            "SSP": clean_number(row.iloc[12]) if len(row) > 12 else 0,
-            "Target": clean_number(row.iloc[15]) if len(row) > 15 else None,
-            "Pct_Target": clean_number(row.iloc[16]) if len(row) > 16 else None,
+        lookup[_nbo_key(name)] = {
+            "Lives": clean_number(row.iloc[cols["Lives"]]),
+            "AC": clean_number(row.iloc[cols["AC"]]),
+            "NSC": clean_number(row.iloc[cols["NSC"]]),
+            "SSP": clean_number(row.iloc[cols["SSP"]]) if len(row) > cols["SSP"] else 0,
         }
-        
-        if record["Lives"] > 0 or record["AC"] > 0:
-            rows.append(record)
+    return lookup
 
-    if not rows:
-        return pd.DataFrame()
+def _supplement_current_metrics(record, sheet2_lookup, source_lookup):
+    """Fill blank current-period cells from Sheet2 or SOURCE."""
+    if record["AC"] > 0 or record["Lives"] > 0:
+        return record
 
-    df = pd.DataFrame(rows)
+    key = _nbo_key(record["NBO"])
+    if key in sheet2_lookup:
+        src = sheet2_lookup[key]
+    elif record["NBO"].upper() in source_lookup:
+        src = source_lookup[record["NBO"].upper()]
+    else:
+        return record
 
+    record["Lives"] = src.get("Lives", record["Lives"])
+    record["AC"] = src.get("AC", record["AC"])
+    record["NSC"] = src.get("NSC", record["NSC"])
+    if record.get("SSP", 0) == 0 and src.get("SSP"):
+        record["SSP"] = src["SSP"]
+    return record
+
+def _load_source_mtd_lookup(file):
+    """SOURCE sheet has MTD metrics when PER NBO cols D-F are blank."""
+    lookup = {}
+    try:
+        raw = pd.read_excel(file, sheet_name="SOURCE", header=None)
+    except Exception:
+        return lookup
+    for idx in range(2, len(raw)):
+        row = raw.iloc[idx]
+        if len(row) < 6:
+            continue
+        name = None
+        for col in (0, 1):
+            if len(row) > col and _looks_like_nbo_name(row.iloc[col]):
+                name = str(row.iloc[col]).strip().upper()
+                break
+        if not name:
+            continue
+        lookup[name] = {
+            "Lives": clean_number(row.iloc[3]),
+            "AC": clean_number(row.iloc[4]),
+            "NSC": clean_number(row.iloc[5]),
+        }
+        if len(row) > 6:
+            lookup[name]["SSP"] = clean_number(row.iloc[6])
+    return lookup
+
+def _apply_source_mtd_fallback(rows, lookup):
+    """Legacy wrapper — prefer _supplement_current_metrics per row."""
+    for record in rows:
+        _supplement_current_metrics(record, {}, lookup)
+    return rows
+
+def _normalize_pct_target(value):
+    pct = clean_number(value)
+    if pct <= 0:
+        return 0
+    return pct * 100 if pct <= 1.5 else pct
+
+def enrich_dataframe(df, report_type):
+    """Add growth, rank, and productivity columns required by the dashboard."""
+    if df.empty:
+        return df
+
+    df = df.copy()
     df["AC_Growth"] = df.apply(lambda x: safe_divide(x["AC"] - x["AC_PY"], x["AC_PY"]) * 100, axis=1)
     df["NSC_Growth"] = df.apply(lambda x: safe_divide(x["NSC"] - x["NSC_PY"], x["NSC_PY"]) * 100, axis=1)
     df["Lives_Growth"] = df.apply(lambda x: safe_divide(x["Lives"] - x["Lives_PY"], x["Lives_PY"]) * 100, axis=1)
-
     df["AC_Per_Life"] = df.apply(lambda x: safe_divide(x["AC"], x["Lives"]), axis=1)
     df["NSC_Per_Life"] = df.apply(lambda x: safe_divide(x["NSC"], x["Lives"]), axis=1)
-
     df["AC_Rank"] = df["AC"].rank(method="min", ascending=False).astype(int)
     df["NSC_Rank"] = df["NSC"].rank(method="min", ascending=False).astype(int)
+    df["Report_Type"] = report_type
+
+    if "SSP" in df.columns:
+        df["SSP_Growth"] = df.apply(
+            lambda x: safe_divide(x["SSP"] - x.get("SSP_PY", 0), x.get("SSP_PY", 0)) * 100, axis=1
+        )
+
+    if "Target" not in df.columns:
+        df["Target"] = None
+    if "Pct_Target" not in df.columns:
+        df["Pct_Target"] = None
 
     return df
 
 @st.cache_data
-def load_mtd_report(file):
+def load_production_report(file, report_type, _parser_version=8):
+    """Load YTD or MTD from PER NBO (same layout). YTD adds target cols N-O."""
     try:
         raw = pd.read_excel(file, sheet_name="PER NBO", header=None)
     except Exception as e:
-        st.error(f"Error loading MTD file: {e}")
+        st.error(f"Error loading {report_type} file: {e}")
         return pd.DataFrame()
 
+    sheet2_lookup = _load_sheet2_lookup(file)
+    source_lookup = _load_source_mtd_lookup(file)
     rows = []
     territory = None
-    
+
     for idx, row in raw.iterrows():
-        if idx < 3:
+        if idx < HEADER_ROWS or len(row) < 9:
             continue
-            
-        if len(row) < 10:
+
+        name = _parse_nbo_name(row)
+        if not name:
             continue
-            
-        name = row.iloc[1] if len(row) > 1 else None
-        if pd.isna(name):
-            name = row.iloc[2] if len(row) > 2 else None
-            
-        if pd.isna(name):
-            continue
-            
-        name = str(name).strip()
-        if not name or name.startswith('NBO NAME'):
-            continue
-            
-        if "TERRITORY" in name.upper():
+
+        if "TERRITORY" in name.upper() and not _is_centurion_name(name):
             territory = name
             continue
-            
-        record = {
-            "Territory": territory,
-            "NBO": name,
-            "Lives": clean_number(row.iloc[3]) if len(row) > 3 else 0,
-            "AC": clean_number(row.iloc[4]) if len(row) > 4 else 0,
-            "NSC": clean_number(row.iloc[5]) if len(row) > 5 else 0,
-            "Lives_PY": clean_number(row.iloc[6]) if len(row) > 6 else 0,
-            "AC_PY": clean_number(row.iloc[7]) if len(row) > 7 else 0,
-            "NSC_PY": clean_number(row.iloc[8]) if len(row) > 8 else 0,
-            "SSP_Current": clean_number(row.iloc[12]) if len(row) > 12 else 0,
-            "SSP_Prior": clean_number(row.iloc[13]) if len(row) > 13 else 0,
-        }
-        
-        if record["Lives"] > 0 or record["AC"] > 0:
-            rows.append(record)
+
+        record = _build_record(row, name, territory, report_type)
+        record = _supplement_current_metrics(record, sheet2_lookup, source_lookup)
+        rows.append(record)
 
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    
-    if not df.empty:
-        df["AC_Growth"] = df.apply(lambda x: safe_divide(x["AC"] - x["AC_PY"], x["AC_PY"]) * 100, axis=1)
-        df["NSC_Growth"] = df.apply(lambda x: safe_divide(x["NSC"] - x["NSC_PY"], x["NSC_PY"]) * 100, axis=1)
-        df["SSP_Growth"] = df.apply(lambda x: safe_divide(x["SSP_Current"] - x["SSP_Prior"], x["SSP_Prior"]) * 100, axis=1)
-        df["AC_Per_Life"] = df.apply(lambda x: safe_divide(x["AC"], x["Lives"]), axis=1)
+    return enrich_dataframe(pd.DataFrame(rows), report_type)
 
-    return df
+def find_centurion(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    names = df["NBO"].astype(str).str.upper().str.strip()
+    mask = names.str.contains("CENTURION", case=False, na=False)
+    return df[mask]
+
+def format_nbo_sample(df, limit=8):
+    if df is None or df.empty:
+        return "none"
+    sample = df["NBO"].astype(str).head(limit).tolist()
+    suffix = f" … and {len(df) - limit} more" if len(df) > limit else ""
+    return ", ".join(sample) + suffix
+
+def has_target_data(row):
+    target = row.get("Target")
+    pct = row.get("Pct_Target")
+    return (target is not None and clean_number(target) > 0) or (pct is not None and clean_number(pct) > 0)
+
+def get_period_labels(data_source):
+    if data_source == "MTD":
+        return {
+            "period": "this month",
+            "period_short": "MTD",
+            "ac_label": "Monthly Life AC",
+            "nsc_label": "Monthly Life NSC",
+            "lives_label": "Lives (This Month)",
+            "py_label": "same month last year",
+            "growth_context": "vs same month last year",
+            "rank_context": "among all NBOs this month",
+        }
+    return {
+        "period": "year to date",
+        "period_short": "YTD",
+        "ac_label": "Year-to-Date Life AC",
+        "nsc_label": "Year-to-Date Life NSC",
+        "lives_label": "Lives (YTD)",
+        "py_label": "prior year to date",
+        "growth_context": "vs prior year to date",
+        "rank_context": "among all NBOs year to date",
+    }
+
+@st.cache_data
+def load_ytd_report(file):
+    return load_production_report(file, "YTD")
+
+@st.cache_data
+def load_mtd_report(file):
+    return load_production_report(file, "MTD")
 
 # ============================================================================
 # CALCULATION ENGINE
@@ -421,23 +594,31 @@ def load_mtd_report(file):
 
 def determine_verdict(health_score):
     if health_score >= 85:
-        return {"label": "STRONG", "icon": "check_circle", "color": COLORS["success"], "description": "Exceptional performance across all metrics"}
+        return {"label": "STRONG", "icon": "check_circle", "color": COLORS["success"], "description": "Performance is excellent — keep current strategy"}
     elif health_score >= 70:
-        return {"label": "STABLE", "icon": "trending_up", "color": COLORS["warning"], "description": "Solid performance with some areas for improvement"}
+        return {"label": "STABLE", "icon": "trending_up", "color": COLORS["warning"], "description": "Solid results with room to improve in a few areas"}
     elif health_score >= 50:
-        return {"label": "AT RISK", "icon": "warning", "color": COLORS["warning"], "description": "Underperforming in key metrics, requires attention"}
+        return {"label": "AT RISK", "icon": "warning", "color": COLORS["warning"], "description": "Below expectations — review growth and competitive position"}
     else:
-        return {"label": "CRITICAL", "icon": "error", "color": COLORS["danger"], "description": "Significant underperformance, immediate action needed"}
+        return {"label": "CRITICAL", "icon": "error", "color": COLORS["danger"], "description": "Well below target — immediate leadership review recommended"}
 
-def calculate_health_score(row, df):
+def _health_score_weights(include_target):
+    if include_target:
+        return {"ac": 0.25, "nsc": 0.15, "target": 0.25, "productivity": 0.15, "rank": 0.10, "momentum": 0.10}
+    return {"ac": 0.30, "nsc": 0.20, "target": 0.0, "productivity": 0.20, "rank": 0.15, "momentum": 0.15}
+
+def calculate_health_score(row, df, include_target=None):
+    if include_target is None:
+        include_target = has_target_data(row)
+
     ac_growth = row["AC_Growth"]
     ac_score = max(0, min(100, 50 + (ac_growth / 2)))
     
     nsc_growth = row["NSC_Growth"]
     nsc_score = max(0, min(100, 50 + (nsc_growth / 2)))
     
-    target_pct = row.get("Pct_Target", 0) or 0
-    target_score = min(target_pct, 100)
+    target_pct = clean_number(row.get("Pct_Target", 0))
+    target_score = min(target_pct, 100) if include_target else 50
     
     company_avg = df["AC_Per_Life"].mean() if df["AC_Per_Life"].mean() > 0 else 1
     productivity_score = min((row["AC_Per_Life"] / company_avg) * 100, 150) if company_avg > 0 else 50
@@ -447,7 +628,7 @@ def calculate_health_score(row, df):
     
     momentum_score = 80 if (ac_growth > 0 and nsc_growth > 0) else 60 if (ac_growth > 0 or nsc_growth > 0) else 40
     
-    weights = {"ac": 0.25, "nsc": 0.15, "target": 0.25, "productivity": 0.15, "rank": 0.10, "momentum": 0.10}
+    weights = _health_score_weights(include_target)
     health_score = (
         ac_score * weights["ac"] +
         nsc_score * weights["nsc"] +
@@ -458,15 +639,18 @@ def calculate_health_score(row, df):
     )
     return max(0, min(100, health_score))
 
-def calculate_health_score_components(row, df):
+def calculate_health_score_components(row, df, include_target=None):
+    if include_target is None:
+        include_target = has_target_data(row)
+
     ac_growth = row["AC_Growth"]
     ac_score = max(0, min(100, 50 + (ac_growth / 2)))
     
     nsc_growth = row["NSC_Growth"]
     nsc_score = max(0, min(100, 50 + (nsc_growth / 2)))
     
-    target_pct = row.get("Pct_Target", 0) or 0
-    target_score = min(target_pct, 100)
+    target_pct = clean_number(row.get("Pct_Target", 0))
+    target_score = min(target_pct, 100) if include_target else 50
     
     company_avg = df["AC_Per_Life"].mean() if df["AC_Per_Life"].mean() > 0 else 1
     productivity_score = min((row["AC_Per_Life"] / company_avg) * 100, 150) if company_avg > 0 else 50
@@ -476,7 +660,7 @@ def calculate_health_score_components(row, df):
     
     momentum_score = 80 if (ac_growth > 0 and nsc_growth > 0) else 60 if (ac_growth > 0 or nsc_growth > 0) else 40
     
-    weights = {"ac": 0.25, "nsc": 0.15, "target": 0.25, "productivity": 0.15, "rank": 0.10, "momentum": 0.10}
+    weights = _health_score_weights(include_target)
     health_score = (
         ac_score * weights["ac"] +
         nsc_score * weights["nsc"] +
@@ -486,13 +670,17 @@ def calculate_health_score_components(row, df):
         momentum_score * weights["momentum"]
     )
     health_score = max(0, min(100, health_score))
+
+    target_display = f"{target_pct:.1f}%" if include_target else "N/A (MTD report)"
+    target_note = "" if include_target else "Target data comes from YTD reports only"
     
     return {
         "score": health_score,
+        "include_target": include_target,
         "components": {
             "AC Growth": {"score": ac_score, "weight": weights["ac"], "value": ac_growth, "display": f"{ac_growth:.1f}%"},
             "NSC Growth": {"score": nsc_score, "weight": weights["nsc"], "value": nsc_growth, "display": f"{nsc_growth:.1f}%"},
-            "Target Attainment": {"score": target_score, "weight": weights["target"], "value": target_pct, "display": f"{target_pct:.1f}%"},
+            "Target Attainment": {"score": target_score, "weight": weights["target"], "value": target_pct, "display": target_display, "note": target_note},
             "Productivity": {"score": productivity_score, "weight": weights["productivity"], "value": row["AC_Per_Life"], "display": format_peso(row["AC_Per_Life"])},
             "Competitive Position": {"score": rank_score, "weight": weights["rank"], "value": row["AC_Rank"], "display": f"#{row['AC_Rank']}"},
             "Momentum": {"score": momentum_score, "weight": weights["momentum"], "value": "Positive" if ac_growth > 0 else "Negative", "display": "Positive" if ac_growth > 0 else "Negative"}
@@ -549,19 +737,37 @@ def calculate_threat_metrics(row, df):
     return threats
 
 def calculate_forecast(row):
-    target = row.get("Target", row["AC"] * 2.5)
-    if target == 0:
-        target = row["AC"] * 2.5
-    
-    target_attainment = safe_divide(row["AC"], target) * 100
-    annual_projection = row["AC"] * 2
-    
+    ac = clean_number(row.get("AC", 0))
+    has_target = has_target_data(row)
+    target = clean_number(row.get("Target")) if has_target else 0
+
+    if has_target and target == 0 and clean_number(row.get("Pct_Target", 0)) > 0:
+        target = safe_divide(ac, clean_number(row.get("Pct_Target", 0)) / 100)
+
+    if has_target and target > 0:
+        pct = clean_number(row.get("Pct_Target", 0))
+        target_attainment = pct if pct > 0 else safe_divide(ac, target) * 100
+        is_mtd = str(row.get("Report_Type", "")).upper() == "MTD"
+        annual_projection = ac * 12 if is_mtd else ac * 2
+        if pct > 0:
+            gap_to_target = max(target * (1 - pct / 100), 0)
+        elif is_mtd:
+            gap_to_target = max(target - ac, 0)
+        else:
+            gap_to_target = max(target - annual_projection, 0)
+    else:
+        target_attainment = 0
+        annual_projection = ac * 12 if ac > 0 else 0  # MTD: rough annualized from monthly pace
+        target = 0
+        gap_to_target = 0
+
     return {
         "target": target,
+        "has_target": has_target,
         "target_attainment": target_attainment,
-        "gap_to_target": max(target - annual_projection, 0),
+        "gap_to_target": gap_to_target,
         "annual_projection": annual_projection,
-        "current_ac": row["AC"],
+        "current_ac": ac,
     }
 
 def calculate_revenue_leakage(row):
@@ -585,24 +791,32 @@ def calculate_revenue_leakage(row):
 # UI COMPONENTS
 # ============================================================================
 
-def render_alert_box(verdict, health_score):
+def render_alert_box(verdict, health_score, data_source, include_target=False):
+    labels = get_period_labels(data_source)
     if health_score < 50:
         alert_class, icon_name, icon_color = "alert-danger", "error", "danger"
     elif health_score < 70:
         alert_class, icon_name, icon_color = "alert-warning", "warning", "warning"
     else:
         alert_class, icon_name, icon_color = "alert-success", "check_circle", "success"
+
+    score_note = (
+        "Growth, productivity, rank, momentum, and SSP target attainment for this month."
+        if data_source == "MTD" and include_target
+        else "Growth, productivity, rank, and momentum for this month."
+        if data_source == "MTD"
+        else "Growth, target progress, productivity, rank, and momentum for the year so far."
+    )
     
     st.markdown(f"""
     <div class="alert-box {alert_class}">
         <div class="alert-icon">{render_icon(icon_name, size="lg", color=icon_color)}</div>
         <div class="alert-content">
-            <div class="alert-title">Verdict: {verdict['label']}</div>
-            <div class="alert-description">{verdict['description']}</div>
+            <div class="alert-title">Bottom Line: {verdict['label']}</div>
+            <div class="alert-description">{verdict['description']} ({labels['period_short']} view)</div>
             <div class="alert-explanation">
                 {render_icon('info', size='sm', color='grey')}
-                Health Score combines 6 metrics: AC Growth (25%), NSC Growth (15%), Target Attainment (25%), 
-                Productivity (15%), Competitive Rank (10%), and Momentum (10%)
+                Health Score ({health_score:.0f}/100) for {labels['period']}: {score_note}
             </div>
         </div>
     </div>
@@ -629,6 +843,7 @@ def render_insight_card(icon_name, title, content, status="info", explanation=No
     st.markdown(html, unsafe_allow_html=True)
 
 def render_executive_overview(row, df, health_score, verdict, data_source):
+    labels = get_period_labels(data_source)
     logo_html = load_logo()
     if logo_html:
         st.markdown(f"""
@@ -677,32 +892,40 @@ def render_executive_overview(row, df, health_score, verdict, data_source):
         """, unsafe_allow_html=True)
 
     with col2:
-        st.metric("Annualized AC", format_peso(row["AC"]), delta=f"{row['AC_Growth']:.1f}%" if row.get("AC_Growth") else None)
+        st.metric(labels["ac_label"], format_peso(row["AC"]), delta=f"{row['AC_Growth']:.1f}% {labels['growth_context']}")
     with col3:
-        st.metric("Annualized NSC", format_peso(row["NSC"]), delta=f"{row['NSC_Growth']:.1f}%" if row.get("NSC_Growth") else None)
+        st.metric(labels["nsc_label"], format_peso(row["NSC"]), delta=f"{row['NSC_Growth']:.1f}% {labels['growth_context']}")
     with col4:
-        st.metric("Lives", f"{row['Lives']:,.0f}", delta=f"{row['Lives_Growth']:.1f}%" if row.get("Lives_Growth") else None)
+        st.metric(labels["lives_label"], f"{row['Lives']:,.0f}", delta=f"{row.get('Lives_Growth', 0):.1f}% {labels['growth_context']}")
     with col5:
-        pct_rank = row['AC_Rank']/df.shape[0]*100 if df.shape[0] > 0 else 0
-        st.metric("AC Rank", f"#{row['AC_Rank']} of {df.shape[0]}", delta=f"Top {pct_rank:.0f}%" if df.shape[0] > 0 else "")
+        pct_rank = 100 - (row['AC_Rank']/df.shape[0]*100) if df.shape[0] > 0 else 0
+        st.metric("AC Rank", f"#{row['AC_Rank']} of {df.shape[0]}", delta=f"Top {pct_rank:.0f}% {labels['rank_context']}")
     with col6:
-        target_pct = row.get("Pct_Target", 0) or 0
-        st.metric("Target Attainment", f"{target_pct:.1f}%", delta="On Track" if target_pct > 80 else "Needs Attention" if target_pct > 50 else "Behind Target")
+        if has_target_data(row):
+            target_pct = clean_number(row.get("Pct_Target", 0))
+            st.metric("Target Attainment", f"{target_pct:.1f}%", delta="On Track" if target_pct > 80 else "Needs Attention" if target_pct > 50 else "Behind Target")
+        else:
+            st.metric("SSP", format_peso(row.get("SSP", 0)), delta=f"{row.get('SSP_Growth', 0):.1f}% vs PY" if row.get("SSP_Growth") is not None else None)
 
-    render_alert_box(verdict, health_score)
+    render_alert_box(verdict, health_score, data_source, include_target=has_target_data(row))
 
-def render_component_breakdown(health_data):
+def render_component_breakdown(health_data, data_source):
+    labels = get_period_labels(data_source)
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('assessment', size='lg', color='gold')}
-        <h3 style="margin:0;">Health Score Components</h3>
+        <h3 style="margin:0;">What Drives Your Score ({labels['period_short']})</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">Each component contributes to the overall health score. Higher scores mean better performance.</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">
+        Each bar shows how you score on one factor. Higher is better. Weights show how much each factor counts toward your Health Score.
+    </p>
     """, unsafe_allow_html=True)
     
     components = health_data['components']
     cols = st.columns(3)
     for idx, (name, data) in enumerate(components.items()):
+        if data.get("weight", 0) == 0:
+            continue
         with cols[idx % 3]:
             status = "strong" if data['score'] >= 70 else "stable" if data['score'] >= 50 else "risk"
             icon_map = {
@@ -716,14 +939,16 @@ def render_component_breakdown(health_data):
             icon_name = icon_map.get(name, "assessment")
             
             # Plain English explanation
+            period_word = labels["period"]
             explanations = {
-                "AC Growth": "How much your Annualized Commission has grown compared to last year",
-                "NSC Growth": "How much your New Single Commission has grown compared to last year",
-                "Target Attainment": "Percentage of your annual target you've achieved so far",
-                "Productivity": "How much AC you generate per life (efficiency measure)",
-                "Competitive Position": "Your rank compared to other NBOs",
-                "Momentum": "Whether you're trending in the right direction"
+                "AC Growth": f"How much Life AC grew {labels['growth_context']} ({period_word})",
+                "NSC Growth": f"How much new business commission grew {labels['growth_context']}",
+                "Target Attainment": "How much of your annual sales target you have reached (YTD reports only)",
+                "Productivity": "Life AC earned per client — higher means more revenue per life",
+                "Competitive Position": f"Your rank {labels['rank_context']} (#1 is best)",
+                "Momentum": "Whether both AC and new business are moving in the right direction"
             }
+            extra_note = f"<br><em>{data['note']}</em>" if data.get("note") else ""
             
             st.markdown(f"""
             <div class="component-card">
@@ -742,260 +967,234 @@ def render_component_breakdown(health_data):
                     Score: {data['score']:.0f}/100
                 </div>
                 <div style="font-size:0.75rem; color:#6B7280; margin-top:0.25rem; font-style:italic;">
-                    {render_icon('info', size='sm', color='grey')} {explanations.get(name, '')}
+                    {render_icon('info', size='sm', color='grey')} {explanations.get(name, '')}{extra_note}
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
 def render_executive_briefing(row, health_score, verdict, threats, forecast, df, data_source):
+    labels = get_period_labels(data_source)
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('description', size='lg', color='gold')}
-        <h3 style="margin:0;">Executive Briefing - {data_source}</h3>
+        <h3 style="margin:0;">Executive Briefing — {labels['period_short']}</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">What this data means for CENTURION TREE</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">
+        Plain-language summary for leadership. All numbers are for <strong>{labels['period']}</strong>.
+    </p>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="explanation" style="margin-bottom:1rem;">
+        {render_icon('menu_book', size='sm', color='grey')}
+        <strong>Quick glossary:</strong>
+        <strong>Life AC</strong> = commission from life insurance production ·
+        <strong>Life NSC</strong> = commission from new policies ·
+        <strong>Lives</strong> = number of clients ·
+        <strong>Rank</strong> = position vs other NBO offices (#1 is best)
+    </div>
     """, unsafe_allow_html=True)
     
-    # Performance summary - plain English
-    rank_pct = row['AC_Rank']/df.shape[0]*100 if df.shape[0] > 0 else 0
+    rank_pct = 100 - (row['AC_Rank']/df.shape[0]*100) if df.shape[0] > 0 else 0
+    ac_change = row['AC'] - row['AC_PY']
+    change_word = "up" if ac_change >= 0 else "down"
+
     st.markdown(f"""
     <div class="insight-box gold-border">
         <div style="display:flex; align-items:center; gap:0.5rem;">
             {render_icon('analytics', size='md', color='gold')}
-            <span class="insight-title">Performance Summary</span>
+            <span class="insight-title">The Headline ({labels['period_short']})</span>
         </div>
         <div class="insight-content">
-            <strong>Here's how CENTURION TREE is performing:</strong><br><br>
-            • Total Annualized Commission: <strong>{format_peso(row['AC'])}</strong>
-            • Health Score: <strong>{health_score:.0f}/100</strong> - This is a {verdict['label'].lower()} position
-            • Rank: <strong>#{row['AC_Rank']}</strong> out of <strong>{df.shape[0]}</strong> NBOs
-            • You're in the <strong>top {rank_pct:.0f}%</strong> of performers
+            CENTURION TREE is <strong>{verdict['label'].lower()}</strong> with a Health Score of <strong>{health_score:.0f}/100</strong>.<br><br>
+            • <strong>{labels['ac_label']}:</strong> {format_peso(row['AC'])} ({change_word} {format_peso(abs(ac_change))} vs {labels['py_label']})<br>
+            • <strong>{labels['nsc_label']}:</strong> {format_peso(row['NSC'])}<br>
+            • <strong>{labels['lives_label']}:</strong> {row['Lives']:,.0f}<br>
+            • <strong>Rank:</strong> #{row['AC_Rank']} of {df.shape[0]} NBOs — top {rank_pct:.0f}% {labels['rank_context']}
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Growth explanation
     if row["AC_Growth"] > 0:
-        status, icon, title = "strong", "trending_up", f"Good News: AC is Growing at {row['AC_Growth']:.1f}%"
+        status, icon, title = "strong", "trending_up", f"Life AC is up {row['AC_Growth']:.1f}% {labels['growth_context']}"
         content = f"""
-        <strong>Your Annualized Commission is increasing.</strong><br><br>
-        • Last year: <strong>{format_peso(row['AC_PY'])}</strong>
-        • This year: <strong>{format_peso(row['AC'])}</strong>
-        • You've gained <strong>{format_peso(row['AC'] - row['AC_PY'])}</strong> in AC
-        • This is <strong>positive momentum</strong> - keep doing what's working!
+        <strong>Revenue from life production is growing.</strong><br><br>
+        • {labels['py_label'].title()}: <strong>{format_peso(row['AC_PY'])}</strong><br>
+        • {labels['period_short']} now: <strong>{format_peso(row['AC'])}</strong><br>
+        • Net gain: <strong>{format_peso(row['AC'] - row['AC_PY'])}</strong><br><br>
+        <strong>What this means:</strong> Current activity is beating last year's pace for this same period. Protect what's working.
         """
-        explanation = f"AC Growth compares current year to last year. {row['AC_Growth']:.1f}% growth means you're acquiring more business or higher-value clients."
+        explanation = f"A positive {row['AC_Growth']:.1f}% means you are producing more Life AC than at this point last year."
     else:
-        status, icon, title = "risk", "trending_down", f"Alert: AC is Declining at {abs(row['AC_Growth']):.1f}%"
+        status, icon, title = "risk", "trending_down", f"Life AC is down {abs(row['AC_Growth']):.1f}% {labels['growth_context']}"
         content = f"""
-        <strong>Your Annualized Commission is decreasing.</strong><br><br>
-        • Last year: <strong>{format_peso(row['AC_PY'])}</strong>
-        • This year: <strong>{format_peso(row['AC'])}</strong>
-        • You've lost <strong>{format_peso(abs(row['AC_PY'] - row['AC']))}</strong> in AC
-        • <strong>Action needed:</strong> Review what's changed and identify growth opportunities
+        <strong>Revenue from life production is below last year.</strong><br><br>
+        • {labels['py_label'].title()}: <strong>{format_peso(row['AC_PY'])}</strong><br>
+        • {labels['period_short']} now: <strong>{format_peso(row['AC'])}</strong><br>
+        • Shortfall: <strong>{format_peso(abs(row['AC_PY'] - row['AC']))}</strong><br><br>
+        <strong>What to do:</strong> Review pipeline, advisor activity, and top client segments. Prioritize actions that close the gap fastest.
         """
-        explanation = f"AC Growth compares current year to last year. A decline of {abs(row['AC_Growth']):.1f}% needs attention. Focus on top-performing products and client segments."
+        explanation = f"A decline of {abs(row['AC_Growth']):.1f}% means less Life AC than the same period last year — this needs a clear recovery plan."
     
     render_insight_card(icon, title, content, status, explanation)
 
-    # Competitive position - plain English
+    if row["NSC_Growth"] > 0:
+        nsc_status, nsc_icon, nsc_title = "strong", "add_circle", f"New business is up {row['NSC_Growth']:.1f}%"
+        nsc_content = f"""
+        <strong>New policy sales are contributing more than last year.</strong><br>
+        Life NSC: <strong>{format_peso(row['NSC'])}</strong> vs {format_peso(row['NSC_PY'])} last year.
+        """
+    else:
+        nsc_status, nsc_icon, nsc_title = "risk", "remove_circle", f"New business is down {abs(row['NSC_Growth']):.1f}%"
+        nsc_content = f"""
+        <strong>Fewer new policies are being sold than last year.</strong><br>
+        Life NSC: <strong>{format_peso(row['NSC'])}</strong> vs {format_peso(row['NSC_PY'])} last year.
+        Focus on prospecting and new business campaigns.
+        """
+    render_insight_card(nsc_icon, nsc_title, nsc_content, nsc_status,
+                        "Life NSC measures commission from newly issued business — it signals future growth.")
+
     if threats.get("gap_to_next", 0) > 0:
-        status, icon, title = "stable", "rocket", f"Opportunity: Move Up to #{row['AC_Rank'] - 1}"
+        status, icon, title = "stable", "rocket", f"One rank away: #{row['AC_Rank'] - 1}"
         content = f"""
-        <strong>You have a clear opportunity to improve your ranking.</strong><br><br>
-        • Next NBO: <strong>{threats['next_nbo']}</strong> with {format_peso(threats['next_ac'])}
-        • Gap to overtake them: <strong>{format_peso(threats['gap_to_next'])}</strong>
-        • That's <strong>{threats['opportunity_percent']:.1f}%</strong> more AC than you have now
-        • <strong>Suggestion:</strong> Focus on high-value clients and products to close this gap
+        <strong>You can move up one spot with focused effort.</strong><br><br>
+        • NBO ahead of you: <strong>{threats['next_nbo']}</strong> ({format_peso(threats['next_ac'])})<br>
+        • You need: <strong>{format_peso(threats['gap_to_next'])}</strong> more Life AC ({threats['opportunity_percent']:.1f}% increase)<br><br>
+        <strong>What to do:</strong> Target high-value cases and advisors closest to closing.
         """
-        explanation = f"The gap to {threats['next_nbo']} is the additional AC needed to move up one rank. Every ₱1 of AC counts toward closing this gap."
+        explanation = "Closing this gap moves CENTURION TREE up one rank in the leaderboard."
     else:
-        status, icon, title = "strong", "emoji_events", "Top Performer - No Competitors Ahead"
+        status, icon, title = "strong", "emoji_events", "You hold the #1 rank"
         content = f"""
-        <strong>Congratulations! You're the #1 performer.</strong><br><br>
-        • No NBO has higher AC than you
-        • Focus on maintaining your position
-        • Keep growing to extend your lead
+        <strong>No other NBO has higher Life AC {labels['rank_context']}.</strong><br><br>
+        Protect your lead by maintaining advisor activity and client retention.
         """
-        explanation = "Being rank #1 means you're the top performer. The focus should be on maintaining and extending this position."
+        explanation = "Rank #1 means you lead the field for this reporting period."
     
     render_insight_card(icon, title, content, status, explanation)
 
-    # Target performance - plain English
-    target_pct = row.get("Pct_Target", 0) or 0
-    if target_pct > 80:
-        status, icon, title = "strong", "target", f"Target Performance: {target_pct:.1f}% - On Track!"
-        content = f"""
-        <strong>You're making good progress toward your annual target.</strong><br><br>
-        • Target: <strong>{format_peso(forecast['target'])}</strong>
-        • Achieved: <strong>{format_peso(row['AC'])}</strong>
-        • That's <strong>{target_pct:.1f}%</strong> of your target
-        • <strong>Keep it up!</strong> You're on track to exceed your target
-        """
-        explanation = f"Target attainment shows how much of your annual target you've achieved. {target_pct:.1f}% means you're ahead of schedule."
-    elif target_pct > 50:
-        status, icon, title = "stable", "target", f"Target Performance: {target_pct:.1f}% - Needs Acceleration"
-        content = f"""
-        <strong>You're making progress, but need to accelerate.</strong><br><br>
-        • Target: <strong>{format_peso(forecast['target'])}</strong>
-        • Achieved: <strong>{format_peso(row['AC'])}</strong>
-        • Remaining: <strong>{format_peso(forecast['gap_to_target'])}</strong>
-        • <strong>Suggestion:</strong> Increase sales activities and focus on high-value opportunities
-        """
-        explanation = f"Target attainment of {target_pct:.1f}% means you have {format_peso(forecast['gap_to_target'])} left to reach your target. Accelerate your efforts."
-    else:
-        status, icon, title = "critical", "error", f"Target Alert: {target_pct:.1f}% - Urgent Action Needed"
-        content = f"""
-        <strong>Target attainment is significantly behind schedule.</strong><br><br>
-        • Target: <strong>{format_peso(forecast['target'])}</strong>
-        • Achieved: <strong>{format_peso(row['AC'])}</strong>
-        • Gap: <strong>{format_peso(forecast['gap_to_target'])}</strong>
-        • <strong>Action required:</strong> Urgent review of sales strategy and target approach needed
-        """
-        explanation = f"Target attainment of {target_pct:.1f}% requires immediate intervention. Focus on high-value opportunities and accelerate sales activities."
-    
-    render_insight_card(icon, title, content, status, explanation)
+    if has_target_data(row):
+        target_pct = clean_number(row.get("Pct_Target", 0))
+        if target_pct > 80:
+            status, icon, title = "strong", "target", f"Annual target: {target_pct:.1f}% reached — on track"
+            content = f"""
+            <strong>You are on pace to hit your annual target.</strong><br><br>
+            • Target: <strong>{format_peso(forecast['target'])}</strong><br>
+            • Achieved (YTD): <strong>{format_peso(row['AC'])}</strong><br>
+            • Progress: <strong>{target_pct:.1f}%</strong>
+            """
+            explanation = "Target attainment compares year-to-date Life AC against your full-year goal."
+        elif target_pct > 50:
+            status, icon, title = "stable", "target", f"Annual target: {target_pct:.1f}% — need to speed up"
+            content = f"""
+            <strong>Progress is OK but not fast enough for the year-end goal.</strong><br><br>
+            • Target: <strong>{format_peso(forecast['target'])}</strong><br>
+            • Achieved: <strong>{format_peso(row['AC'])}</strong><br>
+            • Still needed: <strong>{format_peso(forecast['gap_to_target'])}</strong>
+            """
+            explanation = f"At {target_pct:.1f}%, you need {format_peso(forecast['gap_to_target'])} more Life AC to reach target."
+        else:
+            status, icon, title = "critical", "error", f"Annual target: only {target_pct:.1f}% — urgent action"
+            content = f"""
+            <strong>Significantly behind the annual target.</strong><br><br>
+            • Target: <strong>{format_peso(forecast['target'])}</strong><br>
+            • Achieved: <strong>{format_peso(row['AC'])}</strong><br>
+            • Gap: <strong>{format_peso(forecast['gap_to_target'])}</strong><br><br>
+            Schedule an immediate sales review and recovery plan.
+            """
+            explanation = "Low target attainment requires a structured catch-up plan with weekly tracking."
+        render_insight_card(icon, title, content, status, explanation)
+    elif data_source == "MTD" and not has_target_data(row):
+        render_insight_card(
+            "calendar_month", "Monthly snapshot — no annual target in this file",
+            f"""<strong>This MTD report shows {labels['period']} performance only.</strong><br><br>
+            Upload a <strong>YTD file</strong> to see annual target progress, or use the rank and growth insights above to guide this month's priorities.""",
+            "info",
+            "MTD files do not include annual targets. The dashboard still scores growth, rank, productivity, and momentum from MTD data alone."
+        )
 
 def render_mtd_comparison(ytd_row, mtd_row, df):
+    months = max(datetime.now().month, 1)
+    month_name = datetime.now().strftime("%B")
+
+    mtd_ac, mtd_nsc, mtd_lives = mtd_row["AC"], mtd_row["NSC"], mtd_row["Lives"]
+    avg_ac = ytd_row["AC"] / months
+    avg_nsc = ytd_row["NSC"] / months
+    avg_lives = ytd_row["Lives"] / months
+
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('compare_arrows', size='lg', color='gold')}
-        <h3 style="margin:0;">MTD vs YTD Comparison</h3>
+        <h3 style="margin:0;">This Month vs YTD Monthly Pace</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">How this month compares to your average month</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">
+        Compares your <strong>MTD file</strong> (this month's production) against your
+        <strong>YTD monthly average</strong> (YTD totals ÷ {months} months through {month_name}).
+    </p>
     """, unsafe_allow_html=True)
-    
-    # Calculate MTD vs YTD monthly average
-    mtd_ac = mtd_row["AC"]
-    mtd_nsc = mtd_row["NSC"]
-    mtd_lives = mtd_row["Lives"]
-    
-    ytd_monthly_avg_ac = ytd_row["AC"] / 6
-    ytd_monthly_avg_nsc = ytd_row["NSC"] / 6
-    ytd_monthly_avg_lives = ytd_row["Lives"] / 6
-    
-    ac_diff_pct = safe_divide(mtd_ac - ytd_monthly_avg_ac, ytd_monthly_avg_ac) * 100
-    nsc_diff_pct = safe_divide(mtd_nsc - ytd_monthly_avg_nsc, ytd_monthly_avg_nsc) * 100
-    lives_diff_pct = safe_divide(mtd_lives - ytd_monthly_avg_lives, ytd_monthly_avg_lives) * 100
-    
-    # Three key metrics
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if ac_diff_pct > 0:
+
+    metrics = [
+        ("Life AC", mtd_ac, avg_ac, format_peso),
+        ("Life NSC", mtd_nsc, avg_nsc, format_peso),
+        ("Lives", mtd_lives, avg_lives, lambda v: f"{v:,.0f}"),
+    ]
+
+    cols = st.columns(3)
+    results = []
+    for col, (label, mtd_val, avg_val, fmt) in zip(cols, metrics):
+        diff_pct = safe_divide(mtd_val - avg_val, avg_val) * 100
+        results.append(diff_pct)
+        with col:
             st.metric(
-                label="AC - This Month vs Average",
-                value=f"+{ac_diff_pct:.1f}%",
-                delta=f"{format_peso(mtd_ac)} vs {format_peso(ytd_monthly_avg_ac)}",
-                delta_color="normal"
+                f"{label} — MTD vs Avg",
+                f"{diff_pct:+.1f}%",
+                f"{fmt(mtd_val)} this month vs {fmt(avg_val)} avg",
+                delta_color="normal" if diff_pct >= 0 else "inverse",
             )
-            st.markdown(f"""
-            <div class="explanation">
-                {render_icon('trending_up', size='sm', color='success')} 
-                This month is performing <strong>{ac_diff_pct:.1f}% better</strong> than your average month.
-                This is <strong>great momentum</strong>!
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.metric(
-                label="AC - This Month vs Average",
-                value=f"{ac_diff_pct:.1f}%",
-                delta=f"{format_peso(mtd_ac)} vs {format_peso(ytd_monthly_avg_ac)}",
-                delta_color="inverse"
-            )
-            st.markdown(f"""
-            <div class="explanation">
-                {render_icon('trending_down', size='sm', color='danger')} 
-                This month is performing <strong>{abs(ac_diff_pct):.1f}% lower</strong> than your average month.
-                <strong>Action needed</strong> to improve performance.
-            </div>
-            """, unsafe_allow_html=True)
-    
-    with col2:
-        if nsc_diff_pct > 0:
-            st.metric(
-                label="NSC - This Month vs Average",
-                value=f"+{nsc_diff_pct:.1f}%",
-                delta=f"{format_peso(mtd_nsc)} vs {format_peso(ytd_monthly_avg_nsc)}",
-                delta_color="normal"
-            )
-            st.markdown(f"""
-            <div class="explanation">
-                {render_icon('trending_up', size='sm', color='success')} 
-                NSC is <strong>{nsc_diff_pct:.1f}% higher</strong> than your average month.
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.metric(
-                label="NSC - This Month vs Average",
-                value=f"{nsc_diff_pct:.1f}%",
-                delta=f"{format_peso(mtd_nsc)} vs {format_peso(ytd_monthly_avg_nsc)}",
-                delta_color="inverse"
-            )
-            st.markdown(f"""
-            <div class="explanation">
-                {render_icon('trending_down', size='sm', color='danger')} 
-                NSC is <strong>{abs(nsc_diff_pct):.1f}% lower</strong> than your average month.
-            </div>
-            """, unsafe_allow_html=True)
-    
-    with col3:
-        if lives_diff_pct > 0:
-            st.metric(
-                label="Lives - This Month vs Average",
-                value=f"+{lives_diff_pct:.1f}%",
-                delta=f"{mtd_lives:,.0f} vs {ytd_monthly_avg_lives:,.0f}",
-                delta_color="normal"
-            )
-            st.markdown(f"""
-            <div class="explanation">
-                {render_icon('trending_up', size='sm', color='success')} 
-                Lives are <strong>{lives_diff_pct:.1f}% higher</strong> than your average month.
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.metric(
-                label="Lives - This Month vs Average",
-                value=f"{lives_diff_pct:.1f}%",
-                delta=f"{mtd_lives:,.0f} vs {ytd_monthly_avg_lives:,.0f}",
-                delta_color="inverse"
-            )
-            st.markdown(f"""
-            <div class="explanation">
-                {render_icon('trending_down', size='sm', color='danger')} 
-                Lives are <strong>{abs(lives_diff_pct):.1f}% lower</strong> than your average month.
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Overall assessment
-    st.markdown("### What This Means for You")
-    
-    positive_count = sum([ac_diff_pct > 0, nsc_diff_pct > 0, lives_diff_pct > 0])
-    
-    if positive_count == 3:
-        st.success(f"""
-        {render_icon('check_circle', size='md', color='success')} 
-        **Excellent Month!** All metrics are above average.
-        - Your AC, NSC, and Lives are all performing better than usual
-        - This is a sign of **strong momentum**
-        - Keep doing what you're doing, and consider documenting your successful strategies
-        """)
-    elif positive_count >= 2:
-        st.info(f"""
-        {render_icon('trending_up', size='md', color='info')} 
-        **Good Month!** Most metrics are above average.
-        - {positive_count} out of 3 metrics are performing better than usual
-        - Focus on improving the metric(s) that are underperforming
-        - You're on the right track
-        """)
+            if diff_pct >= 0:
+                render_callout(
+                    f"{label} is ahead of pace",
+                    f"You are <strong>{diff_pct:.1f}% above</strong> your {month_name} YTD monthly average. Keep this momentum.",
+                    "success" if diff_pct >= 5 else "info",
+                )
+            else:
+                render_callout(
+                    f"{label} is behind pace",
+                    f"You are <strong>{abs(diff_pct):.1f}% below</strong> your YTD monthly average "
+                    f"({fmt(mtd_val)} vs {fmt(avg_val)}). Focus advisor activity to close the gap.",
+                    "warning" if diff_pct > -20 else "danger",
+                )
+
+    st.markdown("### What This Means")
+    ahead = sum(1 for d in results if d >= 0)
+    if ahead == 3:
+        render_callout(
+            "Strong month across the board",
+            "Life AC, Life NSC, and Lives are all running above your YTD monthly pace. "
+            "Document what is working and replicate it next month.",
+            "success",
+        )
+    elif ahead >= 2:
+        render_callout(
+            "Mostly on track",
+            f"{ahead} of 3 metrics are above your YTD monthly average. "
+            "Review the lagging metric with your team this week.",
+            "info",
+        )
+    elif ahead == 1:
+        render_callout(
+            "Mixed month — action needed",
+            "Only one metric is above your YTD monthly pace. "
+            "Prioritize pipeline reviews and high-value case closing to recover.",
+            "warning",
+        )
     else:
-        st.warning(f"""
-        {render_icon('warning', size='md', color='warning')} 
-        **Needs Attention.** Most metrics are below average.
-        - Only {positive_count} out of 3 metrics are above average
-        - <strong>Action needed:</strong> Review what's changed this month
-        - Consider accelerating sales activities and focusing on high-value opportunities
-        """)
+        render_callout(
+            "Below pace on all metrics",
+            f"This month's production is below your YTD monthly average on Life AC, NSC, and Lives. "
+            f"Schedule an immediate review of advisor activity, pipeline, and conversion.",
+            "danger",
+        )
 
 def render_threat_monitor(threats, row):
     st.markdown(f"""
@@ -1010,99 +1209,119 @@ def render_threat_monitor(threats, row):
     
     with col1:
         if threats["gap_to_next"] > 0:
-            st.info(f"""
-            <strong>{render_icon('rocket', size='md', color='info')} Opportunity</strong><br><br>
-            <strong>{threats['next_nbo']}</strong> is currently ahead of you.<br>
-            • Their AC: {format_peso(threats['next_ac'])}<br>
-            • Your AC: {format_peso(row['AC'])}<br>
-            • Gap: {format_peso(threats['gap_to_next'])}<br><br>
-            You need <strong>+{threats['opportunity_percent']:.1f}%</strong> more AC to overtake them.
-            """)
+            render_callout(
+                "Opportunity to move up",
+                f"<strong>{threats['next_nbo']}</strong> is ahead of you with {format_peso(threats['next_ac'])} Life AC. "
+                f"You have {format_peso(row['AC'])}. You need {format_peso(threats['gap_to_next'])} more "
+                f"({threats['opportunity_percent']:.1f}% increase) to overtake them.",
+                "info",
+            )
         else:
-            st.success(f"""
-            <strong>{render_icon('emoji_events', size='md', color='success')} Top Position</strong><br><br>
-            You are the <strong>#1 performer</strong> among all NBOs.<br>
-            No one is ahead of you. Keep up the great work!
-            """)
+            render_callout(
+                "You hold the top spot",
+                "No other NBO has higher Life AC than you. Focus on maintaining and extending your lead.",
+                "success",
+            )
     
     with col2:
         if threats["gap_to_prev"] > 0:
             threat_pct = safe_divide(threats["gap_to_prev"], row["AC"]) * 100
             if threat_pct < 5:
-                st.warning(f"""
-                <strong>{render_icon('warning', size='md', color='warning')} HIGH Threat</strong><br><br>
-                <strong>{threats['prev_nbo']}</strong> is very close behind you.<br>
-                • Their AC: {format_peso(row['AC'] - threats['gap_to_prev'])}<br>
-                • Your AC: {format_peso(row['AC'])}<br>
-                • Gap: {format_peso(threats['gap_to_prev'])}<br>
-                • That's only <strong>{threat_pct:.1f}%</strong> of your AC<br><br>
-                <strong>Action needed:</strong> Accelerate growth to maintain your position.
-                """)
+                render_callout(
+                    "High threat — competitor very close",
+                    f"<strong>{threats['prev_nbo']}</strong> is only {format_peso(threats['gap_to_prev'])} "
+                    f"({threat_pct:.1f}%) behind you. Accelerate growth to protect your rank.",
+                    "warning",
+                )
             elif threat_pct < 10:
-                st.info(f"""
-                <strong>{render_icon('trending_up', size='md', color='info')} Medium Threat</strong><br><br>
-                <strong>{threats['prev_nbo']}</strong> is gaining on you.<br>
-                • Gap: {format_peso(threats['gap_to_prev'])}<br>
-                • That's {threat_pct:.1f}% of your AC<br><br>
-                Keep growing to stay ahead.
-                """)
+                render_callout(
+                    "Moderate threat",
+                    f"<strong>{threats['prev_nbo']}</strong> is {format_peso(threats['gap_to_prev'])} "
+                    f"({threat_pct:.1f}%) behind. Keep production steady to stay ahead.",
+                    "info",
+                )
             else:
-                st.success(f"""
-                <strong>{render_icon('shield', size='md', color='success')} Low Threat</strong><br><br>
-                <strong>{threats['prev_nbo']}</strong> is behind you with a comfortable lead.<br>
-                • Gap: {format_peso(threats['gap_to_prev'])}<br>
-                • That's {threat_pct:.1f}% of your AC<br><br>
-                You have a <strong>comfortable buffer</strong>. Maintain your performance.
-                """)
+                render_callout(
+                    "Low threat — comfortable lead",
+                    f"<strong>{threats['prev_nbo']}</strong> is {format_peso(threats['gap_to_prev'])} behind. "
+                    "You have a comfortable buffer.",
+                    "success",
+                )
         else:
-            st.info(f"""
-            <strong>{render_icon('shield', size='md', color='info')} No Immediate Threats</strong><br><br>
-            There are no NBOs close behind you in the rankings.
-            Focus on growing your AC to move up further.
-            """)
+            render_callout(
+                "No immediate threat from behind",
+                "No NBO is close behind you in the rankings. Focus on closing the gap to the next rank up.",
+                "info",
+            )
 
-def render_forecast_center(forecast, row):
+def render_forecast_center(forecast, row, data_source="YTD"):
+    labels = get_period_labels(data_source)
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('trending_up', size='lg', color='gold')}
-        <h3 style="margin:0;">Forecast Center</h3>
+        <h3 style="margin:0;">Forecast Center — {labels['period_short']}</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">Projected performance based on current trends</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">Projected performance based on current {labels['period']} trends</p>
     """, unsafe_allow_html=True)
-    
-    fig = make_subplots(rows=1, cols=2, specs=[[{"type": "indicator"}, {"type": "bar"}]],
-                        subplot_titles=("Target Progress", "Annual Projection Scenarios"))
-    
-    fig.add_trace(go.Indicator(mode="gauge+number+delta", value=forecast["target_attainment"],
-                               domain={"x": [0, 1], "y": [0, 1]}, delta={"reference": 100},
-                               gauge={"axis": {"range": [0, 150]}, "bar": {"color": SUN_LIFE_GOLD},
-                                      "steps": [{"range": [0, 50], "color": "red"},
-                                               {"range": [50, 80], "color": "yellow"},
-                                               {"range": [80, 150], "color": "green"}],
-                                      "threshold": {"line": {"color": "black", "width": 4},
-                                                   "thickness": 0.75, "value": 100}}),
-                  row=1, col=1)
-    
+
     current_ac = forecast["current_ac"]
-    scenarios = {"Worst Case": current_ac * 1.8, "Expected": current_ac * 2.2, "Best Case": current_ac * 2.5}
-    fig.add_trace(go.Bar(x=list(scenarios.keys()), y=list(scenarios.values()),
-                         text=[format_peso(v) for v in scenarios.values()], textposition="auto",
-                         marker_color=[COLORS["danger"], SUN_LIFE_GOLD, COLORS["success"]]),
-                  row=1, col=2)
-    
-    fig.update_layout(height=350, showlegend=False, template="plotly_white", margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+    has_target = forecast.get("has_target", False)
+
+    if has_target:
+        fig = make_subplots(rows=1, cols=2, specs=[[{"type": "indicator"}, {"type": "bar"}]],
+                            subplot_titles=("Target Progress", "Annual Projection Scenarios"))
+        fig.add_trace(go.Indicator(mode="gauge+number+delta", value=forecast["target_attainment"],
+                                   domain={"x": [0, 1], "y": [0, 1]}, delta={"reference": 100},
+                                   gauge={"axis": {"range": [0, 150]}, "bar": {"color": SUN_LIFE_GOLD},
+                                          "steps": [{"range": [0, 50], "color": "red"},
+                                                   {"range": [50, 80], "color": "yellow"},
+                                                   {"range": [80, 150], "color": "green"}],
+                                          "threshold": {"line": {"color": "black", "width": 4},
+                                                       "thickness": 0.75, "value": 100}}),
+                      row=1, col=1)
+        scenarios = {"Worst Case": current_ac * 1.8, "Expected": current_ac * 2.2, "Best Case": current_ac * 2.5}
+        fig.add_trace(go.Bar(x=list(scenarios.keys()), y=list(scenarios.values()),
+                             text=[format_peso(v) for v in scenarios.values()], textposition="auto",
+                             marker_color=[COLORS["danger"], SUN_LIFE_GOLD, COLORS["success"]]),
+                      row=1, col=2)
+        fig.update_layout(height=350, showlegend=False, template="plotly_white", margin=dict(l=0, r=0, t=50, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info(
+            "Annual target progress is available in **YTD reports** only. "
+            f"Below is a monthly run-rate view based on {labels['period']} Life AC."
+        )
+        scenarios = {
+            "Current Month": current_ac,
+            "3-Month Pace": current_ac * 3,
+            "Annualized (×12)": current_ac * 12,
+        }
+        fig = go.Figure(go.Bar(
+            x=list(scenarios.keys()), y=list(scenarios.values()),
+            text=[format_peso(v) for v in scenarios.values()], textposition="auto",
+            marker_color=[SUN_LIFE_GOLD, COLORS["info"], COLORS["success"]],
+        ))
+        fig.update_layout(title=f"{labels['period_short']} Run-Rate Scenarios", height=350, template="plotly_white",
+                          margin=dict(l=0, r=0, t=50, b=0), yaxis_title="Life AC")
+        st.plotly_chart(fig, use_container_width=True)
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.info(f"**Current Daily Pace**\n\n{format_peso(forecast['annual_projection'] / 365)} per day")
-    with col2:
-        st.info(f"**Annual Projection**\n\n{format_peso(forecast['annual_projection'])}")
-    with col3:
-        if forecast["gap_to_target"] > 0:
-            st.warning(f"**Gap to Target**\n\n{format_peso(forecast['gap_to_target'])}")
+        if data_source == "MTD":
+            st.info(f"**This Month (Life AC)**\n\n{format_peso(current_ac)}")
         else:
-            st.success("**Target Achieved**\n\n✅ On track to meet or exceed target")
+            st.info(f"**Current Daily Pace**\n\n{format_peso(forecast['annual_projection'] / 365)} per day")
+    with col2:
+        label = "Annualized (×12)" if data_source == "MTD" else "Annual Projection"
+        st.info(f"**{label}**\n\n{format_peso(forecast['annual_projection'])}")
+    with col3:
+        if has_target:
+            if forecast["gap_to_target"] > 0:
+                st.warning(f"**Gap to Target**\n\n{format_peso(forecast['gap_to_target'])}")
+            else:
+                st.success("**Target Achieved**\n\n✅ On track to meet or exceed target")
+        else:
+            st.info("**Annual Target**\n\nUpload YTD file to track target progress")
 
 def render_productivity_benchmark(row, df):
     st.markdown(f"""
@@ -1154,38 +1373,42 @@ def render_revenue_leakage(leakage, recovery, row):
     col1, col2 = st.columns(2)
     with col1:
         if leakage["ac_leakage"] > 0:
-            st.error(f"""
-            <strong>{render_icon('warning', size='md', color='danger')} AC Leakage Detected</strong><br><br>
-            • You've lost {format_peso(leakage['ac_leakage'])} in AC compared to last year<br>
-            • That's {safe_divide(leakage['ac_leakage'], row['AC_PY']) * 100:.1f}% of last year's total<br><br>
-            <strong>Recovery Scenarios:</strong>
-            """)
+            render_callout(
+                "Life AC below last year",
+                f"You are down {format_peso(leakage['ac_leakage'])} vs the same period last year "
+                f"({safe_divide(leakage['ac_leakage'], row['AC_PY']) * 100:.1f}% of prior-year Life AC). "
+                "Recovery scenarios below show what partial recovery would look like.",
+                "danger",
+            )
             rec_df = pd.DataFrame({
                 "Recovery Rate": list(recovery.keys()),
                 "Recovered AC": [format_peso(r["ac"]) for r in recovery.values()]
             })
             st.dataframe(rec_df, hide_index=True, use_container_width=True)
         else:
-            st.success(f"""
-            <strong>{render_icon('check_circle', size='md', color='success')} No AC Leakage</strong><br><br>
-            Your AC has increased or remained stable compared to last year.
-            Current: {format_peso(row['AC'])} vs Last Year: {format_peso(row['AC_PY'])}
-            """)
+            render_callout(
+                "No Life AC leakage",
+                f"Life AC is stable or up vs last year. "
+                f"Current: {format_peso(row['AC'])} · Prior year same period: {format_peso(row['AC_PY'])}",
+                "success",
+            )
     
     with col2:
         if leakage["lives_leakage"] > 0:
-            st.warning(f"""
-            <strong>{render_icon('groups', size='md', color='warning')} Lives Leakage Detected</strong><br><br>
-            • You've lost {leakage['lives_leakage']:,.0f} lives compared to last year<br>
-            • That's {safe_divide(leakage['lives_leakage'], row['Lives_PY']) * 100:.1f}% of last year's total<br>
-            • <strong>Action needed:</strong> Focus on client retention and acquisition
-            """)
+            render_callout(
+                "Lives below last year",
+                f"You are down {leakage['lives_leakage']:,.0f} lives "
+                f"({safe_divide(leakage['lives_leakage'], row['Lives_PY']) * 100:.1f}% vs prior year). "
+                "Focus on retention and new business prospecting.",
+                "warning",
+            )
         else:
-            st.success(f"""
-            <strong>{render_icon('check_circle', size='md', color='success')} No Lives Leakage</strong><br><br>
-            Your lives have increased or remained stable.
-            Current: {row['Lives']:,.0f} vs Last Year: {row['Lives_PY']:,.0f}
-            """)
+            render_callout(
+                "No lives leakage",
+                f"Lives are stable or up vs last year. "
+                f"Current: {row['Lives']:,.0f} · Prior year: {row['Lives_PY']:,.0f}",
+                "success",
+            )
 
 def render_competitive_position(row, df):
     st.markdown(f"""
@@ -1271,11 +1494,11 @@ def render_management_actions(row, threats, forecast, health_score, data_source)
             "details": f"Need +{threats['opportunity_percent']:.1f}% growth to pass {threats['next_nbo']}. Focus on competitive advantages and key opportunities."
         })
     
-    if forecast.get("gap_to_target", 0) > 0:
+    if has_target_data(row) and forecast.get("gap_to_target", 0) > 0:
         actions.append({
             "priority": "MEDIUM",
             "action": "📊 Accelerate Target Attainment",
-            "details": f"Gap to target: {format_peso(forecast['gap_to_target'])}. Increase sales activities and focus on high-value opportunities."
+            "details": f"Gap to annual target: {format_peso(forecast['gap_to_target'])}. Increase sales activity on high-value opportunities."
         })
     
     if threats.get("productivity_gap", 0) > 0:
@@ -1330,7 +1553,7 @@ def main():
         
         st.markdown("---")
         st.markdown("### Data Sources")
-        st.markdown("*Upload one or both files*")
+        st.markdown("*Upload one or both files — MTD works on its own*")
         ytd_file = st.file_uploader("Upload YTD File", type=["xlsx"], key="ytd")
         mtd_file = st.file_uploader("Upload MTD File", type=["xlsx"], key="mtd")
         
@@ -1338,19 +1561,16 @@ def main():
         
         with st.expander("How Metrics Work"):
             st.markdown("""
-            **Health Score** (0-100)
-            - 25%: AC Growth Rate
-            - 15%: NSC Growth Rate  
-            - 25%: Target Attainment
-            - 15%: Productivity (AC per Life)
-            - 10%: Competitive Rank
-            - 10%: Momentum
+            **Health Score** (0-100) — overall performance at a glance
             
-            **What the numbers mean:**
-            - **AC**: Annualized Commission - your total commission
-            - **NSC**: New Single Commission - commission from new business
-            - **Lives**: Number of clients/ policies
-            - **Rank**: Your position compared to other NBOs (#1 is best)
+            **YTD and MTD use the same PER NBO sheet layout.**  
+            YTD files include columns N (Annual Life AC Target) and O (% to target).
+            
+            **Terms:**
+            - **Life AC** — total life insurance commission
+            - **Life NSC** — commission from new policies
+            - **Lives** — number of clients
+            - **Rank** — position vs other NBOs (#1 is best)
             """)
         
         st.caption("Powered by Sun Life Data Analytics")
@@ -1368,49 +1588,82 @@ def main():
     mtd_df = None
     centurion_ytd = None
     centurion_mtd = None
-    data_source = ""
+    load_errors = []
 
     if ytd_file:
         ytd_df = load_ytd_report(ytd_file)
-        if not ytd_df.empty:
-            centurion_ytd = ytd_df[ytd_df["NBO"].astype(str).str.contains("CENTURION", case=False, na=False)]
-    
+        if ytd_df.empty:
+            load_errors.append("YTD file loaded but no NBO data was found. Check that the **PER NBO** sheet is present.")
+        else:
+            centurion_ytd = find_centurion(ytd_df)
+            if centurion_ytd.empty:
+                load_errors.append(
+                    f"YTD file loaded ({len(ytd_df)} NBOs) but **CENTURION TREE** was not found. "
+                    f"Names found include: {format_nbo_sample(ytd_df)}"
+                )
+
     if mtd_file:
         mtd_df = load_mtd_report(mtd_file)
-        if not mtd_df.empty:
-            centurion_mtd = mtd_df[mtd_df["NBO"].astype(str).str.contains("CENTURION", case=False, na=False)]
+        if mtd_df.empty:
+            load_errors.append("MTD file loaded but no NBO data was found. Check that the **PER NBO** sheet is present.")
+        else:
+            centurion_mtd = find_centurion(mtd_df)
+            if centurion_mtd.empty:
+                load_errors.append(
+                    f"MTD file loaded ({len(mtd_df)} NBOs) but **CENTURION TREE** was not found. "
+                    f"Names found include: {format_nbo_sample(mtd_df)}"
+                )
 
-    # Check if we have data
-    if ytd_df is not None and not ytd_df.empty and centurion_ytd is not None and not centurion_ytd.empty:
-        row = centurion_ytd.iloc[0]
-        df = ytd_df
-        data_source = "YTD"
-        has_ytd = True
-    elif mtd_df is not None and not mtd_df.empty and centurion_mtd is not None and not centurion_mtd.empty:
-        row = centurion_mtd.iloc[0]
-        df = mtd_df
-        data_source = "MTD"
-        has_ytd = False
-    else:
-        st.info("👈 Please upload a YTD or MTD Excel file to begin")
+    ytd_ready = ytd_df is not None and not ytd_df.empty and centurion_ytd is not None and not centurion_ytd.empty
+    mtd_ready = mtd_df is not None and not mtd_df.empty and centurion_mtd is not None and not centurion_mtd.empty
+
+    if not ytd_ready and not mtd_ready:
+        if load_errors:
+            for msg in load_errors:
+                st.error(msg)
+        else:
+            st.info("👈 Upload a **YTD** or **MTD** Excel file to begin. MTD-only is fully supported.")
         st.markdown("""
         ### Getting Started
-        1. Upload a **YTD file** for year-to-date analysis
-        2. Upload a **MTD file** for month-to-date analysis  
-        3. Upload **both** for comprehensive comparison
+        1. Upload an **MTD file** for this month's performance (works without YTD)
+        2. Upload a **YTD file** for year-to-date analysis and annual targets
+        3. Upload **both** to compare this month vs your monthly average
         
         ### What You'll See
-        - **Health Score** - Overall performance metric
-        - **Executive Briefing** - Plain English insights
-        - **Threat Monitor** - Competitive intelligence
-        - **Forecast Center** - Performance projections
-        - **Action Center** - Prioritized next steps
+        - **Health Score** — one number summarizing performance
+        - **Executive Briefing** — plain-English insights for leadership
+        - **Threat Monitor** — who is ahead or behind you
+        - **Action Center** — prioritized next steps
         """)
         return
 
+    # Choose active view: MTD-only uses MTD; when both exist, let user pick
+    if ytd_ready and mtd_ready:
+        view_mode = st.sidebar.radio(
+            "Dashboard view",
+            ["YTD (year to date)", "MTD (this month)"],
+            help="Switch between annual and monthly views when both files are uploaded."
+        )
+        use_mtd = view_mode.startswith("MTD")
+    elif mtd_ready:
+        use_mtd = True
+    else:
+        use_mtd = False
+
+    if use_mtd:
+        row = centurion_mtd.iloc[0]
+        df = mtd_df
+        data_source = "MTD"
+    else:
+        row = centurion_ytd.iloc[0]
+        df = ytd_df
+        data_source = "YTD"
+
+    include_target = has_target_data(row)
+
     # Calculate all metrics
-    health_score = calculate_health_score(row, df)
-    health_data = calculate_health_score_components(row, df)
+    health_score = calculate_health_score(row, df, include_target=include_target)
+    health_data = calculate_health_score_components(row, df, include_target=include_target)
     verdict = determine_verdict(health_score)
     threats = calculate_threat_metrics(row, df)
     forecast = calculate_forecast(row)
@@ -1420,7 +1673,7 @@ def main():
     render_executive_overview(row, df, health_score, verdict, data_source)
     
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-    render_component_breakdown(health_data)
+    render_component_breakdown(health_data, data_source)
     
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     
@@ -1439,7 +1692,7 @@ def main():
         render_executive_briefing(row, health_score, verdict, threats, forecast, df, data_source)
     
     with tabs[1]:
-        render_forecast_center(forecast, row)
+        render_forecast_center(forecast, row, data_source)
     
     with tabs[2]:
         render_threat_monitor(threats, row)
@@ -1456,11 +1709,10 @@ def main():
     with tabs[6]:
         render_management_actions(row, threats, forecast, health_score, data_source)
     
-    # MTD Comparison - only if both files are loaded
-    if ytd_file and mtd_file and ytd_df is not None and mtd_df is not None:
-        if centurion_ytd is not None and not centurion_ytd.empty and centurion_mtd is not None and not centurion_mtd.empty:
-            st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-            render_mtd_comparison(centurion_ytd.iloc[0], centurion_mtd.iloc[0], ytd_df)
+    # MTD vs YTD comparison — when both files are loaded
+    if ytd_ready and mtd_ready and centurion_ytd is not None and centurion_mtd is not None:
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        render_mtd_comparison(centurion_ytd.iloc[0], centurion_mtd.iloc[0], ytd_df)
 
 if __name__ == "__main__":
     main()
