@@ -324,6 +324,77 @@ SHEET2_COLUMNS = {
 }
 HEADER_ROWS = 3
 
+# ============================================================================
+# OFFICIAL NBO VALIDATION
+# ============================================================================
+
+NBO_TERRITORY_MAP = {
+    # METRO NORTH (34)
+    "JACARANDA":"METRO NORTH TERRITORY","MANGO":"METRO NORTH TERRITORY",
+    "MULBERRY":"METRO NORTH TERRITORY","PASSION":"METRO NORTH TERRITORY",
+    "WISTERIA TREE":"METRO NORTH TERRITORY","BLUEWOOD":"METRO NORTH TERRITORY",
+    "JARRAH":"METRO NORTH TERRITORY","MUSTARD TREE":"METRO NORTH TERRITORY",
+    "MYRTLE":"METRO NORTH TERRITORY","STAR MAGNOLIA":"METRO NORTH TERRITORY",
+    "GENESIS":"METRO NORTH TERRITORY","GREEN FIR":"METRO NORTH TERRITORY",
+    "KARRI":"METRO NORTH TERRITORY","MAJESTY":"METRO NORTH TERRITORY",
+    "OSMANTHUS":"METRO NORTH TERRITORY","RED SYCAMORE":"METRO NORTH TERRITORY",
+    "BAOBAB":"METRO NORTH TERRITORY","CYPRESS":"METRO NORTH TERRITORY",
+    "DIAMOND TREE":"METRO NORTH TERRITORY","MENARA TREE":"METRO NORTH TERRITORY",
+    "RED SPRUCE":"METRO NORTH TERRITORY","REDWOOD":"METRO NORTH TERRITORY",
+    "GOPHERWOOD":"METRO NORTH TERRITORY","HEATHER":"METRO NORTH TERRITORY",
+    "HYPERION TREE":"METRO NORTH TERRITORY","IRON OAK":"METRO NORTH TERRITORY",
+    "MILLENNIUM DRAGON":"METRO NORTH TERRITORY","TREE OF LIFE":"METRO NORTH TERRITORY",
+    "BAMBOO":"METRO NORTH TERRITORY","CHESTNUT":"METRO NORTH TERRITORY",
+    "DAU":"METRO NORTH TERRITORY","GRANDIS TREE":"METRO NORTH TERRITORY",
+    "RAINBOW TREE":"METRO NORTH TERRITORY","ROSEWOOD":"METRO NORTH TERRITORY",
+
+    # METRO SOUTH (33)
+    "CANNONBALL":"METRO SOUTH TERRITORY","IVY":"METRO SOUTH TERRITORY",
+    "KOA":"METRO SOUTH TERRITORY","MULAWIN":"METRO SOUTH TERRITORY",
+    "RAVENS TOWER":"METRO SOUTH TERRITORY","SEQUOIA":"METRO SOUTH TERRITORY",
+    "ALMOND":"METRO SOUTH TERRITORY","CEDAR":"METRO SOUTH TERRITORY",
+    "COPAIBA":"METRO SOUTH TERRITORY","CRIMSON QUEEN":"METRO SOUTH TERRITORY",
+    "LAURELWOOD":"METRO SOUTH TERRITORY","ROWAN":"METRO SOUTH TERRITORY",
+    "EMPRESS":"METRO SOUTH TERRITORY","EUCALYPTUS":"METRO SOUTH TERRITORY",
+    "GENUS PINE":"METRO SOUTH TERRITORY","NEEM TREE":"METRO SOUTH TERRITORY",
+    "ROYAL POINCIANA":"METRO SOUTH TERRITORY","SAKURA":"METRO SOUTH TERRITORY",
+    "CACAO":"METRO SOUTH TERRITORY","GOLDENRAIN":"METRO SOUTH TERRITORY",
+    "JOSHUA TREE":"METRO SOUTH TERRITORY","MOLAVE":"METRO SOUTH TERRITORY",
+    "TINDALO":"METRO SOUTH TERRITORY","ALEXANDER PALM":"METRO SOUTH TERRITORY",
+    "ATLAS PALM":"METRO SOUTH TERRITORY","PHOENIX PALM":"METRO SOUTH TERRITORY",
+    "ROYAL PALM":"METRO SOUTH TERRITORY","WALT PALM":"METRO SOUTH TERRITORY",
+    "CENTURION TREE":"METRO SOUTH TERRITORY","KHAYA":"METRO SOUTH TERRITORY",
+    "OAKWOOD":"METRO SOUTH TERRITORY","QUEBRACHO":"METRO SOUTH TERRITORY",
+    "WILLOW TREE":"METRO SOUTH TERRITORY",
+
+    # LUZON (18)
+    "CANARYWOOD":"LUZON TERRITORY","CHERRY TREE":"LUZON TERRITORY",
+    "DRAGONWOOD":"LUZON TERRITORY","GOLDEN SHOWER TREE":"LUZON TERRITORY",
+    "MAGNOLIA WOODS":"LUZON TERRITORY","MAGNUS ALMACIGA":"LUZON TERRITORY",
+    "MORINGA TREE":"LUZON TERRITORY","OLIVE":"LUZON TERRITORY",
+    "SHERMAN":"LUZON TERRITORY","BAYWOOD":"LUZON TERRITORY",
+    "COCONUT":"LUZON TERRITORY","COFFEE TREE":"LUZON TERRITORY",
+    "CRESPON DE MIRTO":"LUZON TERRITORY","EXCELSA":"LUZON TERRITORY",
+    "HONEY TREE":"LUZON TERRITORY","LIBERICA":"LUZON TERRITORY",
+    "LIME TREE":"LUZON TERRITORY","MIRACLE TREE":"LUZON TERRITORY",
+
+    # VISMIN (15)
+    "ACACIA":"VISMIN TERRITORY","ANGEL OAK":"VISMIN TERRITORY",
+    "BRISTLECONE":"VISMIN TERRITORY","CINNAMON":"VISMIN TERRITORY",
+    "CORINTHIAN":"VISMIN TERRITORY","GOLDEN ASPEN":"VISMIN TERRITORY",
+    "JACKFRUIT":"VISMIN TERRITORY","KINGWOOD":"VISMIN TERRITORY",
+    "APPLE":"VISMIN TERRITORY","DURIAN":"VISMIN TERRITORY",
+    "GRAND ELM":"VISMIN TERRITORY","IRONWOOD":"VISMIN TERRITORY",
+    "MANGROVE":"VISMIN TERRITORY","NARRA":"VISMIN TERRITORY",
+    "NETTLE":"VISMIN TERRITORY",
+}
+
+VALID_NBOS = set(NBO_TERRITORY_MAP.keys())
+
+def _is_valid_nbo(name):
+    return _nbo_key(name) in VALID_NBOS
+
+
 def _looks_like_nbo_name(value):
     """True if the cell value looks like an NBO office name, not a metric or row index."""
     if pd.isna(value) or isinstance(value, (int, float, np.integer, np.floating)):
@@ -530,8 +601,13 @@ def enrich_dataframe(df, report_type):
     df["Lives_Growth"] = df.apply(lambda x: safe_divide(x["Lives"] - x["Lives_PY"], x["Lives_PY"]) * 100, axis=1)
     df["AC_Per_Life"] = df.apply(lambda x: safe_divide(x["AC"], x["Lives"]), axis=1)
     df["NSC_Per_Life"] = df.apply(lambda x: safe_divide(x["NSC"], x["Lives"]), axis=1)
+    df["NSC_Multiple"] = df.apply(lambda x: safe_divide(x["NSC"], x["AC"]), axis=1)
     df["AC_Rank"] = df["AC"].rank(method="min", ascending=False).astype(int)
     df["NSC_Rank"] = df["NSC"].rank(method="min", ascending=False).astype(int)
+    df["Lives_Rank"] = df["Lives"].rank(method="min", ascending=False).astype(int)
+    df["Territory_AC_Rank"] = df.groupby("Territory")["AC"].rank(method="min", ascending=False).astype(int)
+    df["Territory_NSC_Rank"] = df.groupby("Territory")["NSC"].rank(method="min", ascending=False).astype(int)
+    df["Territory_Lives_Rank"] = df.groupby("Territory")["Lives"].rank(method="min", ascending=False).astype(int)
     df["Report_Type"] = report_type
 
     if "SSP" in df.columns:
@@ -576,7 +652,19 @@ def load_production_report(file, report_type, _parser_version=10):
             territory = name
             continue
 
-        record = _build_record(row, name, territory, report_type, target_col, pct_col)
+        normalized_name = _nbo_key(name)
+
+        if normalized_name not in VALID_NBOS:
+            continue
+
+        record = _build_record(
+            row,
+            name,
+            NBO_TERRITORY_MAP[normalized_name],
+            report_type,
+            target_col,
+            pct_col,
+        )
         record = _supplement_record(record, sheet2_lookup, source_lookup, report_type)
         rows.append(record)
 
@@ -610,7 +698,7 @@ def get_period_labels(data_source):
             "period": "this month",
             "period_short": "MTD",
             "ac_label": "Monthly Life AC",
-            "nsc_label": "Monthly Life NSC",
+            "nsc_label": "Annualized Production Value",
             "lives_label": "Lives (This Month)",
             "py_label": "same month last year",
             "growth_context": "vs same month last year",
@@ -620,7 +708,7 @@ def get_period_labels(data_source):
         "period": "year to date",
         "period_short": "YTD",
         "ac_label": "Year-to-Date Life AC",
-        "nsc_label": "Year-to-Date Life NSC",
+        "nsc_label": "Annualized Production Value (YTD)",
         "lives_label": "Lives (YTD)",
         "py_label": "prior year to date",
         "growth_context": "vs prior year to date",
@@ -651,8 +739,8 @@ def determine_verdict(health_score):
 
 def _health_score_weights(include_target):
     if include_target:
-        return {"ac": 0.25, "nsc": 0.15, "target": 0.25, "productivity": 0.15, "rank": 0.10, "momentum": 0.10}
-    return {"ac": 0.30, "nsc": 0.20, "target": 0.0, "productivity": 0.20, "rank": 0.15, "momentum": 0.15}
+        return {"ac": 0.30, "nsc": 0.0, "target": 0.25, "productivity": 0.20, "rank": 0.15, "momentum": 0.10}
+    return {"ac": 0.35, "nsc": 0.0, "target": 0.0, "productivity": 0.25, "rank": 0.20, "momentum": 0.20}
 
 def calculate_health_score(row, df, include_target=None):
     if include_target is None:
@@ -864,6 +952,16 @@ def calculate_revenue_leakage(row):
         }
     
     return leakage, recovery
+
+
+
+def get_nsc_mix(nsc_multiple):
+    if nsc_multiple < 1.5:
+        return "Predominantly Annual-Pay", "Annualized value closely mirrors current commission."
+    elif nsc_multiple < 3:
+        return "Balanced Payment Mix", "Annualized value moderately exceeds current commission."
+    else:
+        return "Installment-Heavy Mix", "Annualized value is substantially higher than current commission."
 
 # ============================================================================
 # UI COMPONENTS
