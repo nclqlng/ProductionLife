@@ -285,7 +285,6 @@ def render_icon(icon_name, size="md", color="gold"):
     return f'<span class="material-icons {size_class} {color_class}">{icon_name}</span>'
 
 def render_callout(title, body, style="info"):
-    """Styled message box — avoids raw HTML tags showing in Streamlit widgets."""
     cls = {"success": "alert-success", "warning": "alert-warning", "danger": "alert-danger"}.get(style, "insight-box")
     icon = {"success": "check_circle", "warning": "warning", "danger": "error"}.get(style, "info")
     color = {"success": "success", "warning": "warning", "danger": "danger"}.get(style, "info")
@@ -302,13 +301,6 @@ def render_callout(title, body, style="info"):
 # ============================================================================
 # DATA LOADING
 # ============================================================================
-
-# PER NBO sheet — same layout for YTD and MTD files
-# Col A (0): Full NBO name | Col B (1): Broker code (numeric, NOT a name)
-# Col C (2): Short NBO label | Col D-F (3-5): Current period Lives, AC, NSC
-# Col G-I (6-8): Prior-year same period Lives, AC, NSC | Col M (12): SSP
-# YTD only — Col N (13): 2026 Annual Life AC Target | Col O (14): % to target
-# Sheet2 tab holds current-period values when PER NBO cols D-F are blank
 
 NAME_COLUMNS = (0, 2)
 METRIC_COLUMNS = {
@@ -329,7 +321,6 @@ HEADER_ROWS = 3
 # ============================================================================
 
 NBO_TERRITORY_MAP = {
-    # METRO NORTH (34)
     "JACARANDA":"METRO NORTH TERRITORY","MANGO":"METRO NORTH TERRITORY",
     "MULBERRY":"METRO NORTH TERRITORY","PASSION":"METRO NORTH TERRITORY",
     "WISTERIA TREE":"METRO NORTH TERRITORY","BLUEWOOD":"METRO NORTH TERRITORY",
@@ -347,8 +338,6 @@ NBO_TERRITORY_MAP = {
     "BAMBOO":"METRO NORTH TERRITORY","CHESTNUT":"METRO NORTH TERRITORY",
     "DAU":"METRO NORTH TERRITORY","GRANDIS TREE":"METRO NORTH TERRITORY",
     "RAINBOW TREE":"METRO NORTH TERRITORY","ROSEWOOD":"METRO NORTH TERRITORY",
-
-    # METRO SOUTH (33)
     "CANNONBALL":"METRO SOUTH TERRITORY","IVY":"METRO SOUTH TERRITORY",
     "KOA":"METRO SOUTH TERRITORY","MULAWIN":"METRO SOUTH TERRITORY",
     "RAVENS TOWER":"METRO SOUTH TERRITORY","SEQUOIA":"METRO SOUTH TERRITORY",
@@ -366,8 +355,6 @@ NBO_TERRITORY_MAP = {
     "CENTURION TREE":"METRO SOUTH TERRITORY","KHAYA":"METRO SOUTH TERRITORY",
     "OAKWOOD":"METRO SOUTH TERRITORY","QUEBRACHO":"METRO SOUTH TERRITORY",
     "WILLOW TREE":"METRO SOUTH TERRITORY",
-
-    # LUZON (18)
     "CANARYWOOD":"LUZON TERRITORY","CHERRY TREE":"LUZON TERRITORY",
     "DRAGONWOOD":"LUZON TERRITORY","GOLDEN SHOWER TREE":"LUZON TERRITORY",
     "MAGNOLIA WOODS":"LUZON TERRITORY","MAGNUS ALMACIGA":"LUZON TERRITORY",
@@ -377,8 +364,6 @@ NBO_TERRITORY_MAP = {
     "CRESPON DE MIRTO":"LUZON TERRITORY","EXCELSA":"LUZON TERRITORY",
     "HONEY TREE":"LUZON TERRITORY","LIBERICA":"LUZON TERRITORY",
     "LIME TREE":"LUZON TERRITORY","MIRACLE TREE":"LUZON TERRITORY",
-
-    # VISMIN (15)
     "ACACIA":"VISMIN TERRITORY","ANGEL OAK":"VISMIN TERRITORY",
     "BRISTLECONE":"VISMIN TERRITORY","CINNAMON":"VISMIN TERRITORY",
     "CORINTHIAN":"VISMIN TERRITORY","GOLDEN ASPEN":"VISMIN TERRITORY",
@@ -394,9 +379,7 @@ VALID_NBOS = set(NBO_TERRITORY_MAP.keys())
 def _is_valid_nbo(name):
     return _nbo_key(name) in VALID_NBOS
 
-
 def _looks_like_nbo_name(value):
-    """True if the cell value looks like an NBO office name, not a metric or row index."""
     if pd.isna(value) or isinstance(value, (int, float, np.integer, np.floating)):
         return False
     name = str(value).strip()
@@ -417,7 +400,6 @@ def _is_centurion_name(name):
     return "CENTURION" in str(name).upper()
 
 def _parse_nbo_name(row):
-    """Read NBO name from column A, fallback column C. Column B is always broker code."""
     for col in NAME_COLUMNS:
         if len(row) > col and _looks_like_nbo_name(row.iloc[col]):
             return str(row.iloc[col]).strip()
@@ -436,7 +418,6 @@ def _nbo_key(name):
     return key.strip()
 
 def _build_record(row, name, territory, report_type, target_col=None, pct_col=None):
-    """Build one NBO record from PER NBO column positions."""
     record = {
         "Territory": territory,
         "NBO": name,
@@ -449,7 +430,6 @@ def _build_record(row, name, territory, report_type, target_col=None, pct_col=No
         "SSP": clean_number(row.iloc[METRIC_COLUMNS["SSP"]]) if len(row) > METRIC_COLUMNS["SSP"] else 0,
         "SSP_PY": 0,
     }
-    # YTD only: cols N (Annual Life AC Target) and O (% to target) from header row 2
     if report_type == "YTD":
         t_col = target_col if target_col is not None else METRIC_COLUMNS["Target"]
         p_col = pct_col if pct_col is not None else METRIC_COLUMNS["Pct_Target"]
@@ -460,7 +440,6 @@ def _build_record(row, name, territory, report_type, target_col=None, pct_col=No
     return record
 
 def _load_sheet2_lookup(file):
-    """Sheet2 has current-period metrics when PER NBO cols D-F are blank."""
     lookup = {}
     try:
         xl = pd.ExcelFile(file)
@@ -502,7 +481,6 @@ def _load_sheet2_lookup(file):
     return lookup
 
 def _supplement_record(record, sheet2_lookup, source_lookup, report_type):
-    """Fill blank metrics and YTD target from Sheet2 / SOURCE (e.g. CENTURION row 96)."""
     key = _nbo_key(record["NBO"])
 
     if record["AC"] == 0 and record["Lives"] == 0:
@@ -530,7 +508,6 @@ def _supplement_record(record, sheet2_lookup, source_lookup, report_type):
     return record
 
 def _load_source_mtd_lookup(file):
-    """SOURCE sheet has MTD metrics when PER NBO cols D-F are blank."""
     lookup = {}
     try:
         raw = pd.read_excel(file, sheet_name="SOURCE", header=None)
@@ -562,12 +539,7 @@ def _apply_source_mtd_fallback(rows, lookup):
     return rows
 
 def _detect_ytd_target_columns(raw):
-    """
-    Find Annual Life AC Target and % to target from header row 2 (cols N & O).
-    Returns (target_col, pct_col) or (None, None) if this is not a YTD file.
-    """
     target_col = pct_col = None
-    # Prefer Excel row 2 (index 1), then row 1 (index 0)
     for hi in (1, 0, 2):
         if hi >= len(raw):
             continue
@@ -584,14 +556,12 @@ def _detect_ytd_target_columns(raw):
     return None, None
 
 def _parse_pct_target(value):
-    """Parse % to target from column O — decimal (0.43) or whole number (43)."""
     pct = clean_number(value)
     if pct <= 0:
         return 0
     return pct * 100 if pct <= 1.5 else pct
 
 def enrich_dataframe(df, report_type):
-    """Add growth, rank, and productivity columns required by the dashboard."""
     if df.empty:
         return df
 
@@ -624,7 +594,6 @@ def enrich_dataframe(df, report_type):
 
 @st.cache_data
 def load_production_report(file, report_type, _parser_version=10):
-    """Load YTD or MTD from PER NBO (same layout). YTD adds target cols N-O from row 2 headers."""
     try:
         raw = pd.read_excel(file, sheet_name="PER NBO", header=None)
     except Exception as e:
@@ -737,10 +706,14 @@ def determine_verdict(health_score):
     else:
         return {"label": "CRITICAL", "icon": "error", "color": COLORS["danger"], "description": "Well below target — immediate leadership review recommended"}
 
-def _health_score_weights(include_target):
-    if include_target:
-        return {"ac": 0.30, "nsc": 0.0, "target": 0.25, "productivity": 0.20, "rank": 0.15, "momentum": 0.10}
-    return {"ac": 0.35, "nsc": 0.0, "target": 0.0, "productivity": 0.25, "rank": 0.20, "momentum": 0.20}
+def _health_score_weights(include_target=None):
+    return {
+        "nsc": 0.40,
+        "ac": 0.20,
+        "lives": 0.20,
+        "rank": 0.10,
+        "momentum": 0.10,
+    }
 
 def calculate_health_score(row, df, include_target=None):
     if include_target is None:
@@ -752,11 +725,13 @@ def calculate_health_score(row, df, include_target=None):
     nsc_growth = row["NSC_Growth"]
     nsc_score = max(0, min(100, 50 + (nsc_growth / 2)))
     
+    lives_growth = row["Lives_Growth"]
+    lives_score = max(0, min(100, 50 + (lives_growth / 2)))
     target_pct = clean_number(row.get("Pct_Target", 0))
     target_score = min(target_pct, 100) if include_target else 50
     
     company_avg = df["AC_Per_Life"].mean() if df["AC_Per_Life"].mean() > 0 else 1
-    productivity_score = min((row["AC_Per_Life"] / company_avg) * 100, 150) if company_avg > 0 else 50
+    case_size_score = min((row["AC_Per_Life"] / company_avg) * 100, 150) if company_avg > 0 else 50
     
     total_nbos = df.shape[0]
     rank_score = ((total_nbos - row["AC_Rank"]) / total_nbos * 100) if total_nbos > 0 else 50
@@ -767,8 +742,6 @@ def calculate_health_score(row, df, include_target=None):
     health_score = (
         ac_score * weights["ac"] +
         nsc_score * weights["nsc"] +
-        target_score * weights["target"] +
-        productivity_score * weights["productivity"] +
         rank_score * weights["rank"] +
         momentum_score * weights["momentum"]
     )
@@ -784,11 +757,13 @@ def calculate_health_score_components(row, df, include_target=None):
     nsc_growth = row["NSC_Growth"]
     nsc_score = max(0, min(100, 50 + (nsc_growth / 2)))
     
+    lives_growth = row["Lives_Growth"]
+    lives_score = max(0, min(100, 50 + (lives_growth / 2)))
     target_pct = clean_number(row.get("Pct_Target", 0))
     target_score = min(target_pct, 100) if include_target else 50
     
     company_avg = df["AC_Per_Life"].mean() if df["AC_Per_Life"].mean() > 0 else 1
-    productivity_score = min((row["AC_Per_Life"] / company_avg) * 100, 150) if company_avg > 0 else 50
+    case_size_score = min((row["AC_Per_Life"] / company_avg) * 100, 150) if company_avg > 0 else 50
     
     total_nbos = df.shape[0]
     rank_score = ((total_nbos - row["AC_Rank"]) / total_nbos * 100) if total_nbos > 0 else 50
@@ -799,8 +774,6 @@ def calculate_health_score_components(row, df, include_target=None):
     health_score = (
         ac_score * weights["ac"] +
         nsc_score * weights["nsc"] +
-        target_score * weights["target"] +
-        productivity_score * weights["productivity"] +
         rank_score * weights["rank"] +
         momentum_score * weights["momentum"]
     )
@@ -815,9 +788,15 @@ def calculate_health_score_components(row, df, include_target=None):
         "components": {
             "AC Growth": {"score": ac_score, "weight": weights["ac"], "value": ac_growth, "display": f"{ac_growth:.1f}%"},
             "NSC Growth": {"score": nsc_score, "weight": weights["nsc"], "value": nsc_growth, "display": f"{nsc_growth:.1f}%"},
-            "Target Attainment": {"score": target_score, "weight": weights["target"], "value": target_pct, "display": target_display, "note": target_note},
-            "Productivity": {"score": productivity_score, "weight": weights["productivity"], "value": row["AC_Per_Life"], "display": format_peso(row["AC_Per_Life"])},
-            "Competitive Position": {"score": rank_score, "weight": weights["rank"], "value": row["AC_Rank"], "display": f"#{row['AC_Rank']}"},
+            "Target Attainment": {"score": target_score, "weight": 0, "value": target_pct, "display": target_display, "note": target_note},
+            "Case Size": {"score": case_size_score, "weight": 0, "value": row["AC_Per_Life"], "display": format_peso(row["AC_Per_Life"])},
+            "Lives Growth": {"score": lives_score, "weight": weights["lives"], "value": lives_growth, "display": f"{lives_growth:.1f}%"},
+            "Competitive Position": {
+                "score": rank_score,
+                "weight": weights["rank"],
+                "value": row["AC_Rank"],
+                "display": f"AC #{row['AC_Rank']}<br>NSC #{row['NSC_Rank']}<br>Lives #{row['Lives_Rank']}"
+            },
             "Momentum": {"score": momentum_score, "weight": weights["momentum"], "value": "Positive" if ac_growth > 0 else "Negative", "display": "Positive" if ac_growth > 0 else "Negative"}
         }
     }
@@ -871,24 +850,7 @@ def calculate_threat_metrics(row, df):
     
     return threats
 
-
 def calculate_forecast(row, historical_growth_rates=None):
-    """
-    Forecast methodology:
-    - Uses standard run-rate annualization.
-    - Uses historical growth assumptions for scenarios.
-    - Falls back to conservative assumptions if no history exists.
-
-    Basis:
-    • Annual Projection = Current Monthly AC × 12 (run-rate forecast)
-    • Worst Case = Current AC × (1 + Avg Growth - Std Dev)
-    • Expected = Current AC × (1 + Avg Growth)
-    • Best Case = Current AC × (1 + Avg Growth + Std Dev)
-
-    The scenario multipliers are therefore derived from historical
-    performance instead of arbitrary constants such as ×1.8, ×2.2, and ×2.5.
-    """
-
     ac = clean_number(row.get("AC", 0))
     has_target = has_target_data(row)
     target = clean_number(row.get("Target")) if has_target else 0
@@ -935,7 +897,6 @@ def calculate_forecast(row, historical_growth_rates=None):
         "forecast_methodology": "Run-rate annualization with historical-growth-based scenarios"
     }
 
-
 def calculate_revenue_leakage(row):
     leakage = {
         "ac_leakage": max(row["AC_PY"] - row["AC"], 0),
@@ -952,16 +913,6 @@ def calculate_revenue_leakage(row):
         }
     
     return leakage, recovery
-
-
-
-def get_nsc_mix(nsc_multiple):
-    if nsc_multiple < 1.5:
-        return "Predominantly Annual-Pay", "Annualized value closely mirrors current commission."
-    elif nsc_multiple < 3:
-        return "Balanced Payment Mix", "Annualized value moderately exceeds current commission."
-    else:
-        return "Installment-Heavy Mix", "Annualized value is substantially higher than current commission."
 
 # ============================================================================
 # UI COMPONENTS
@@ -1075,7 +1026,18 @@ def render_executive_overview(row, df, health_score, verdict, data_source):
         st.metric(labels["lives_label"], f"{row['Lives']:,.0f}", delta=f"{row.get('Lives_Growth', 0):.1f}% {labels['growth_context']}")
     with col5:
         pct_rank = 100 - (row['AC_Rank']/df.shape[0]*100) if df.shape[0] > 0 else 0
-        st.metric("AC Rank", f"#{row['AC_Rank']} of {df.shape[0]}", delta=f"Top {pct_rank:.0f}% {labels['rank_context']}")
+        st.markdown(f"""
+        <div style="font-size:0.85rem;color:#6B7280;">
+            Competitive Position
+        </div>
+        <div style="font-size:1.1rem;font-weight:600;line-height:1.4;">
+            AC #{row['AC_Rank']}<br>
+            NSC #{row['NSC_Rank']}<br>
+            Lives #{row['Lives_Rank']}
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption(f"Top {pct_rank:.0f}% {labels['rank_context']}")
+
     with col6:
         if data_source == "YTD" and has_target_data(row):
             target_pct = clean_number(row.get("Pct_Target", 0))
@@ -1108,19 +1070,18 @@ def render_component_breakdown(health_data, data_source):
                 "AC Growth": "trending_up",
                 "NSC Growth": "trending_up",
                 "Target Attainment": "target",
-                "Productivity": "speed",
+                "Case Size": "speed",
                 "Competitive Position": "emoji_events",
                 "Momentum": "rocket"
             }
             icon_name = icon_map.get(name, "assessment")
             
-            # Plain English explanation
             period_word = labels["period"]
             explanations = {
                 "AC Growth": f"How much Life AC grew {labels['growth_context']} ({period_word})",
                 "NSC Growth": f"How much new business commission grew {labels['growth_context']}",
                 "Target Attainment": "How much of your annual sales target you have reached (YTD reports only)",
-                "Productivity": "Life AC earned per client — higher means more revenue per life",
+                "Case Size": "Average Life AC generated per client. Higher values indicate larger-value cases. Not included in Health Score.",
                 "Competitive Position": f"Your rank {labels['rank_context']} (#1 is best)",
                 "Momentum": "Whether both AC and new business are moving in the right direction"
             }
@@ -1245,7 +1206,7 @@ def render_executive_briefing(row, health_score, verdict, threats, forecast, df,
         <strong>No other NBO has higher Life AC {labels['rank_context']}.</strong><br><br>
         Protect your lead by maintaining advisor activity and client retention.
         """
-        explanation = "Rank #1 means you lead the field for this reporting period."
+        explanation = "AC Rank #1 means you lead the field for this reporting period."
     
     render_insight_card(icon, title, content, status, explanation)
 
@@ -1342,33 +1303,30 @@ def render_mtd_comparison(ytd_row, mtd_row, df):
                 )
 
     st.markdown("### What This Means")
-    ahead = sum(1 for d in results if d >= 0)
+    ahead = sum(v >= 0 for v in results)
+
     if ahead == 3:
         render_callout(
             "Strong month across the board",
-            "Life AC, Life NSC, and Lives are all running above your YTD monthly pace. "
-            "Document what is working and replicate it next month.",
+            "Life AC, Life NSC, and Lives are all running above your YTD monthly pace. Document what is working and replicate it next month.",
             "success",
         )
     elif ahead >= 2:
         render_callout(
             "Mostly on track",
-            f"{ahead} of 3 metrics are above your YTD monthly average. "
-            "Review the lagging metric with your team this week.",
+            f"{ahead} of 3 metrics are above your YTD monthly average. Review the lagging metric with your team this week.",
             "info",
         )
     elif ahead == 1:
         render_callout(
             "Mixed month — action needed",
-            "Only one metric is above your YTD monthly pace. "
-            "Prioritize pipeline reviews and high-value case closing to recover.",
+            "Only one metric is above your YTD monthly pace. Prioritize pipeline reviews and high-value case closing to recover.",
             "warning",
         )
     else:
         render_callout(
             "Below pace on all metrics",
-            f"This month's production is below your YTD monthly average on Life AC, NSC, and Lives. "
-            f"Schedule an immediate review of advisor activity, pipeline, and conversion.",
+            "This month's production is below your YTD monthly average on Life AC, NSC, and Lives. Schedule an immediate review of advisor activity, pipeline, and conversion.",
             "danger",
         )
 
@@ -1503,7 +1461,7 @@ def render_productivity_benchmark(row, df):
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('speed', size='lg', color='gold')}
-        <h3 style="margin:0;">Productivity Benchmark</h3>
+        <h3 style="margin:0;">Case Size Benchmark</h3>
     </div>
     <p style="color:#6B7280; margin-bottom:1rem;">How efficient you are compared to others</p>
     """, unsafe_allow_html=True)
@@ -1528,7 +1486,7 @@ def render_productivity_benchmark(row, df):
     
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Your Productivity Rank", f"{percentile:.0f}th percentile", delta=f"of {df.shape[0]} NBOs")
+        st.metric("Your Case Size Rank", f"{percentile:.0f}th percentile", delta=f"of {df.shape[0]} NBOs")
     with col2:
         if row["AC_Per_Life"] >= top_10_avg:
             st.success(f"🏆 You're above the Top 10 average! {format_peso(row['AC_Per_Life'])} vs {format_peso(top_10_avg)}")
@@ -1587,46 +1545,107 @@ def render_revenue_leakage(leakage, recovery, row):
             )
 
 def render_competitive_position(row, df):
+    total = df.shape[0]
+
+    ac_rank = int(row["AC_Rank"])
+    nsc_rank = int(row["NSC_Rank"])
+    lives_rank = int(row["Lives_Rank"])
+
+    ac_pct = ((total - ac_rank) / total) * 100 if total > 0 else 0
+    nsc_pct = ((total - nsc_rank) / total) * 100 if total > 0 else 0
+    lives_pct = ((total - lives_rank) / total) * 100 if total > 0 else 0
+    overall_pct = (ac_pct + nsc_pct + lives_pct) / 3
+
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('emoji_events', size='lg', color='gold')}
         <h3 style="margin:0;">Competitive Position</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">Where you stand among all NBOs</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">Rankings across AC, NSC, and Lives among all NBOs</p>
     """, unsafe_allow_html=True)
     
-    top_n = min(15, df.shape[0])
-    ladder_data = df.nsmallest(top_n, "AC_Rank")[["NBO", "AC", "AC_Rank"]].copy()
-    ladder_data["Color"] = ladder_data["NBO"].apply(
-        lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("AC Rank", f"#{ac_rank}", f"Top {ac_pct:.0f}%")
+    with col2:
+        st.metric("NSC Rank", f"#{nsc_rank}", f"Top {nsc_pct:.0f}%")
+    with col3:
+        st.metric("Lives Rank", f"#{lives_rank}", f"Top {lives_pct:.0f}%")
+    with col4:
+        st.metric("Overall", f"Top {overall_pct:.0f}%", f"of {total} NBOs")
     
-    fig = go.Figure()
-    fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["AC"], orientation="h",
-                         marker_color=ladder_data["Color"],
-                         text=[format_peso(v) for v in ladder_data["AC"]], textposition="outside",
-                         hovertemplate="%{y}<br>AC: %{text}<br>Rank: %{customdata}<extra></extra>",
-                         customdata=ladder_data["AC_Rank"]))
-    fig.update_layout(title="AC Rank Ladder (Top 15)", xaxis_title="Annualized AC", yaxis_title="NBO",
-                      height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+    chart_tabs = st.tabs(["🏆 AC Rank Ladder", "💰 NSC Rank Ladder", "👥 Lives Rank Ladder"])
     
-    row_rank = row["AC_Rank"]
-    total = df.shape[0]
-    ahead = row_rank - 1
-    behind = total - row_rank
+    with chart_tabs[0]:
+        top_n = min(15, df.shape[0])
+        ladder_data = df.nsmallest(top_n, "AC_Rank")[["NBO", "AC", "AC_Rank"]].copy()
+        ladder_data["Color"] = ladder_data["NBO"].apply(
+            lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["AC"], orientation="h",
+                             marker_color=ladder_data["Color"],
+                             text=[format_peso(v) for v in ladder_data["AC"]], textposition="outside",
+                             hovertemplate="%{y}<br>AC: %{text}<br>Rank: %{customdata}<extra></extra>",
+                             customdata=ladder_data["AC_Rank"]))
+        fig.update_layout(title="AC Rank Ladder (Top 15)", xaxis_title="Life AC", yaxis_title="NBO",
+                          height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with chart_tabs[1]:
+        top_n = min(15, df.shape[0])
+        ladder_data = df.nsmallest(top_n, "NSC_Rank")[["NBO", "NSC", "NSC_Rank"]].copy()
+        ladder_data["Color"] = ladder_data["NBO"].apply(
+            lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["NSC"], orientation="h",
+                             marker_color=ladder_data["Color"],
+                             text=[format_peso(v) for v in ladder_data["NSC"]], textposition="outside",
+                             hovertemplate="%{y}<br>NSC: %{text}<br>Rank: %{customdata}<extra></extra>",
+                             customdata=ladder_data["NSC_Rank"]))
+        fig.update_layout(title="NSC Rank Ladder (Top 15)", xaxis_title="Life NSC", yaxis_title="NBO",
+                          height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with chart_tabs[2]:
+        top_n = min(15, df.shape[0])
+        ladder_data = df.nsmallest(top_n, "Lives_Rank")[["NBO", "Lives", "Lives_Rank"]].copy()
+        ladder_data["Color"] = ladder_data["NBO"].apply(
+            lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["Lives"], orientation="h",
+                             marker_color=ladder_data["Color"],
+                             text=[f"{v:,.0f}" for v in ladder_data["Lives"]], textposition="outside",
+                             hovertemplate="%{y}<br>Lives: %{text}<br>Rank: %{customdata}<extra></extra>",
+                             customdata=ladder_data["Lives_Rank"]))
+        fig.update_layout(title="Lives Rank Ladder (Top 15)", xaxis_title="Lives", yaxis_title="NBO",
+                          height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    
+    if ac_rank == 1:
+        rank_insight = "🏆 You're the #1 performer in AC!"
+    elif ac_rank <= 3:
+        rank_insight = f"🥇 You're in the Top 3 for AC (Rank #{ac_rank})"
+    elif ac_rank <= 10:
+        rank_insight = f"⭐ You're in the Top 10 for AC (Rank #{ac_rank})"
+    else:
+        next_rank_ac = df[df["AC_Rank"] < ac_rank].iloc[-1]["AC"] if ac_rank > 1 else 0
+        gap = next_rank_ac - row["AC"] if ac_rank > 1 else 0
+        rank_insight = f"Need +{format_peso(gap)} more AC to move up one rank" if ac_rank > 1 else "🏆 You're the #1 performer!"
     
     st.markdown(f"""
     <div class="insight-box gold-border">
         <div style="display:flex; align-items:center; gap:0.5rem;">
             {render_icon('analytics', size='md', color='gold')}
-            <span class="insight-title">Your Position</span>
+            <span class="insight-title">Position Summary</span>
         </div>
         <div class="insight-content">
-            <strong>Rank #{row_rank} of {total} NBOs</strong><br><br>
-            • <strong>{ahead}</strong> NBOs are ahead of you<br>
-            • <strong>{behind}</strong> NBOs are behind you<br>
-            • You're in the <strong>top {row_rank/total*100:.0f}%</strong> of performers<br><br>
-            {f'<strong>Next target:</strong> Overtake #{row_rank - 1} (need +{format_peso(df.nsmallest(row_rank, "AC_Rank").iloc[-2]["AC"] - row["AC"])})' if row_rank > 1 else '<strong>🏆 You\'re the #1 performer!</strong>'}
+            <strong>🏆 AC Rank:</strong> #{ac_rank} of {total} NBOs · Top {ac_pct:.0f}%<br>
+            <strong>💰 NSC Rank:</strong> #{nsc_rank} of {total} NBOs · Top {nsc_pct:.0f}%<br>
+            <strong>👥 Lives Rank:</strong> #{lives_rank} of {total} NBOs · Top {lives_pct:.0f}%<br><br>
+            <strong>{rank_insight}</strong>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1750,16 +1769,7 @@ def main():
             """)
         
         st.caption("Powered by Sun Life Data Analytics")
-        
-        # Show active data sources
-        if ytd_file and mtd_file:
-            st.success("✅ YTD + MTD loaded")
-        elif ytd_file:
-            st.info("📊 YTD only loaded")
-        elif mtd_file:
-            st.info("📊 MTD only loaded")
 
-    # Determine which data sources are available
     ytd_df = None
     mtd_df = None
     centurion_ytd = None
@@ -1813,7 +1823,6 @@ def main():
         """)
         return
 
-    # Choose active view: MTD-only uses MTD; when both exist, let user pick
     if ytd_ready and mtd_ready:
         view_mode = st.sidebar.radio(
             "Dashboard view",
@@ -1837,7 +1846,6 @@ def main():
 
     include_target = has_target_data(row)
 
-    # Calculate all metrics
     health_score = calculate_health_score(row, df, include_target=include_target)
     health_data = calculate_health_score_components(row, df, include_target=include_target)
     verdict = determine_verdict(health_score)
@@ -1845,7 +1853,6 @@ def main():
     forecast = calculate_forecast(row)
     leakage, recovery = calculate_revenue_leakage(row)
 
-    # Render everything
     render_executive_overview(row, df, health_score, verdict, data_source)
     
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
@@ -1853,12 +1860,11 @@ def main():
     
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     
-    # Create tabs with icons
     tabs = st.tabs([
         "📋 Briefing",
         "📈 Forecast", 
         "🛡️ Threats",
-        "📊 Productivity",
+        "📊 Case Size",
         "💰 Revenue",
         "🏆 Position",
         "🎯 Actions"
@@ -1885,7 +1891,6 @@ def main():
     with tabs[6]:
         render_management_actions(row, threats, forecast, health_score, data_source)
     
-    # MTD vs YTD comparison — when both files are loaded
     if ytd_ready and mtd_ready and centurion_ytd is not None and centurion_mtd is not None:
         st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
         render_mtd_comparison(centurion_ytd.iloc[0], centurion_mtd.iloc[0], ytd_df)
