@@ -221,6 +221,81 @@ st.markdown("""
         color: #2D2D2D;
         margin-left: 0.5rem;
     }
+
+    /* Ranking table styling */
+    .ranking-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+    }
+    .ranking-table th {
+        background: #2D2D2D;
+        color: white;
+        padding: 0.75rem 0.5rem;
+        text-align: left;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+    }
+    .ranking-table td {
+        padding: 0.6rem 0.5rem;
+        border-bottom: 1px solid #E5E7EB;
+    }
+    .ranking-table tr:hover {
+        background: #F3F4F6;
+    }
+    .ranking-table .centurion-row {
+        background: #FDB913 !important;
+        font-weight: 600;
+    }
+    .ranking-table .centurion-row:hover {
+        background: #E5A800 !important;
+    }
+    .ranking-table .rank-number {
+        font-weight: 600;
+        color: #2D2D2D;
+    }
+    .ranking-table .centurion-rank {
+        color: #1a1a2e;
+    }
+    
+    .leaderboard-container {
+        max-height: 600px;
+        overflow-y: auto;
+        border-radius: 8px;
+        border: 1px solid #E5E7EB;
+    }
+    .leaderboard-container::-webkit-scrollbar {
+        width: 8px;
+    }
+    .leaderboard-container::-webkit-scrollbar-track {
+        background: #F1F1F1;
+        border-radius: 4px;
+    }
+    .leaderboard-container::-webkit-scrollbar-thumb {
+        background: #FDB913;
+        border-radius: 4px;
+    }
+    
+    .gold-highlight {
+        background: #FDB913 !important;
+        font-weight: 600;
+        color: #1a1a2e;
+    }
+    
+    .rank-badge {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 12px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        background: #E5E7EB;
+        color: #2D2D2D;
+    }
+    .rank-badge-gold {
+        background: #FDB913;
+        color: #1a1a2e;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -561,6 +636,75 @@ def _parse_pct_target(value):
         return 0
     return pct * 100 if pct <= 1.5 else pct
 
+# ============================================================================
+# RANKING CALCULATIONS (NEW FRAMEWORK)
+# ============================================================================
+
+def calculate_competitive_rankings(df, report_type):
+    """
+    Calculate all competitive rankings for each NBO.
+    Preserves existing Health Score logic.
+    """
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    total_nbos = df.shape[0]
+    
+    # Calculate Growth Score (average of growth percentages)
+    df["Growth_Score"] = (
+        df["AC_Growth"].fillna(0) + 
+        df["NSC_Growth"].fillna(0) + 
+        df["Lives_Growth"].fillna(0)
+    ) / 3
+    
+    # Calculate Growth Rank (highest score = Rank #1) - using min method for ties
+    df["Growth_Rank"] = df["Growth_Score"].rank(method="min", ascending=False).astype(int)
+    
+    # AC Rank - using min method for ties
+    df["AC_Rank"] = df["AC"].rank(method="min", ascending=False).astype(int)
+    
+    # NSC Rank - using min method for ties
+    df["NSC_Rank"] = df["NSC"].rank(method="min", ascending=False).astype(int)
+    
+    # Lives Rank - using min method for ties
+    df["Lives_Rank"] = df["Lives"].rank(method="min", ascending=False).astype(int)
+    
+    # Target Rank (% to Target - only for YTD)
+    if report_type == "YTD" and "Pct_Target" in df.columns:
+        df["Target_Rank"] = df["Pct_Target"].rank(method="min", ascending=False).astype(int)
+    else:
+        df["Target_Rank"] = None
+    
+    # Calculate Overall Competitive Score and Rank
+    if report_type == "YTD":
+        # YTD Weighting: AC=25%, NSC=20%, Lives=15%, Growth=20%, Target=20%
+        df["Competitive_Score"] = (
+            df["AC_Rank"] * 0.25 +
+            df["NSC_Rank"] * 0.20 +
+            df["Lives_Rank"] * 0.15 +
+            df["Growth_Rank"] * 0.20 +
+            df["Target_Rank"].fillna(total_nbos) * 0.20
+        )
+    else:
+        # MTD Weighting: AC=35%, NSC=25%, Lives=20%, Growth=20%
+        df["Competitive_Score"] = (
+            df["AC_Rank"] * 0.35 +
+            df["NSC_Rank"] * 0.25 +
+            df["Lives_Rank"] * 0.20 +
+            df["Growth_Rank"] * 0.20
+        )
+    
+    # Competitive Rank (lowest score = Rank #1) - using min method for ties
+    df["Competitive_Rank"] = df["Competitive_Score"].rank(method="min", ascending=True).astype(int)
+    
+    # Calculate percentile for Competitive Rank
+    df["Competitive_Percentile"] = (
+        (total_nbos - df["Competitive_Rank"] + 1) / total_nbos * 100
+    ).round(1)
+    
+    return df
+
 def enrich_dataframe(df, report_type):
     if df.empty:
         return df
@@ -572,9 +716,11 @@ def enrich_dataframe(df, report_type):
     df["AC_Per_Life"] = df.apply(lambda x: safe_divide(x["AC"], x["Lives"]), axis=1)
     df["NSC_Per_Life"] = df.apply(lambda x: safe_divide(x["NSC"], x["Lives"]), axis=1)
     df["NSC_Multiple"] = df.apply(lambda x: safe_divide(x["NSC"], x["AC"]), axis=1)
-    df["AC_Rank"] = df["AC"].rank(method="min", ascending=False).astype(int)
-    df["NSC_Rank"] = df["NSC"].rank(method="min", ascending=False).astype(int)
-    df["Lives_Rank"] = df["Lives"].rank(method="min", ascending=False).astype(int)
+    
+    # Legacy rank columns (preserved for compatibility)
+    df["AC_Rank_Legacy"] = df["AC"].rank(method="min", ascending=False).astype(int)
+    df["NSC_Rank_Legacy"] = df["NSC"].rank(method="min", ascending=False).astype(int)
+    df["Lives_Rank_Legacy"] = df["Lives"].rank(method="min", ascending=False).astype(int)
     df["Territory_AC_Rank"] = df.groupby("Territory")["AC"].rank(method="min", ascending=False).astype(int)
     df["Territory_NSC_Rank"] = df.groupby("Territory")["NSC"].rank(method="min", ascending=False).astype(int)
     df["Territory_Lives_Rank"] = df.groupby("Territory")["Lives"].rank(method="min", ascending=False).astype(int)
@@ -590,6 +736,9 @@ def enrich_dataframe(df, report_type):
     if "Pct_Target" not in df.columns:
         df["Pct_Target"] = None
 
+    # Calculate competitive rankings using new framework
+    df = calculate_competitive_rankings(df, report_type)
+    
     return df
 
 @st.cache_data
@@ -693,7 +842,7 @@ def load_mtd_report(file, _parser_version=10):
     return load_production_report(file, "MTD", _parser_version=_parser_version)
 
 # ============================================================================
-# CALCULATION ENGINE
+# CALCULATION ENGINE (Health Score - UNCHANGED)
 # ============================================================================
 
 def determine_verdict(health_score):
@@ -801,29 +950,56 @@ def calculate_health_score_components(row, df, include_target=None):
         }
     }
 
+# ============================================================================
+# THREAT METRICS (UPDATED to use Competitive_Rank)
+# ============================================================================
+
 def calculate_threat_metrics(row, df):
-    above = df[df["AC_Rank"] < row["AC_Rank"]]
-    below = df[df["AC_Rank"] > row["AC_Rank"]]
+    """Calculate threat metrics using Competitive_Rank instead of AC_Rank"""
+    df_sorted = df.sort_values("Competitive_Rank")
     
-    threats = {}
+    # Find position of CENTURION TREE in sorted list
+    centurion_pos = df_sorted[df_sorted["NBO"].str.contains("CENTURION", case=False, na=False)].index
     
-    if not above.empty:
-        threats["gap_to_next"] = above.iloc[0]["AC"] - row["AC"]
-        threats["next_nbo"] = above.iloc[0]["NBO"]
-        threats["next_ac"] = above.iloc[0]["AC"]
-    else:
-        threats["gap_to_next"] = 0
-        threats["next_nbo"] = None
+    if len(centurion_pos) > 0:
+        centurion_idx = df_sorted.index.get_loc(centurion_pos[0])
         
-    if not below.empty:
-        threats["gap_to_prev"] = row["AC"] - below.iloc[0]["AC"]
-        threats["prev_nbo"] = below.iloc[0]["NBO"]
-    else:
-        threats["gap_to_prev"] = 0
-        threats["prev_nbo"] = None
+        # Get NBO above (better rank, lower number)
+        if centurion_idx > 0:
+            above = df_sorted.iloc[centurion_idx - 1]
+            gap_to_next = above["AC"] - row["AC"]
+            next_nbo = above["NBO"]
+            next_ac = above["AC"]
+        else:
+            gap_to_next = 0
+            next_nbo = None
+            next_ac = 0
         
-    if threats["gap_to_prev"] > 0:
-        threat_pct = safe_divide(threats["gap_to_prev"], row["AC"]) * 100
+        # Get NBO below (worse rank, higher number)
+        if centurion_idx < len(df_sorted) - 1:
+            below = df_sorted.iloc[centurion_idx + 1]
+            gap_to_prev = row["AC"] - below["AC"]
+            prev_nbo = below["NBO"]
+        else:
+            gap_to_prev = 0
+            prev_nbo = None
+    else:
+        gap_to_next = 0
+        next_nbo = None
+        next_ac = 0
+        gap_to_prev = 0
+        prev_nbo = None
+    
+    threats = {
+        "gap_to_next": gap_to_next,
+        "next_nbo": next_nbo,
+        "next_ac": next_ac,
+        "gap_to_prev": gap_to_prev,
+        "prev_nbo": prev_nbo,
+    }
+    
+    if gap_to_prev > 0:
+        threat_pct = safe_divide(gap_to_prev, row["AC"]) * 100
         if threat_pct < 5:
             threats["threat_level"] = "HIGH"
             threats["threat_text"] = "Immediate threat - competitor is very close"
@@ -837,9 +1013,9 @@ def calculate_threat_metrics(row, df):
         threats["threat_level"] = "NONE"
         threats["threat_text"] = "No immediate threat"
     
-    if threats["gap_to_next"] > 0:
-        threats["opportunity_value"] = threats["gap_to_next"]
-        threats["opportunity_percent"] = safe_divide(threats["gap_to_next"], row["AC"]) * 100
+    if gap_to_next > 0:
+        threats["opportunity_value"] = gap_to_next
+        threats["opportunity_percent"] = safe_divide(gap_to_next, row["AC"]) * 100
     else:
         threats["opportunity_value"] = 0
         threats["opportunity_percent"] = 0
@@ -1025,15 +1201,16 @@ def render_executive_overview(row, df, health_score, verdict, data_source):
     with col4:
         st.metric(labels["lives_label"], f"{row['Lives']:,.0f}", delta=f"{row.get('Lives_Growth', 0):.1f}% {labels['growth_context']}")
     with col5:
-        pct_rank = 100 - (row['AC_Rank']/df.shape[0]*100) if df.shape[0] > 0 else 0
+        # Updated to show Competitive Rank
+        pct_rank = row.get('Competitive_Percentile', 0)
         st.markdown(f"""
         <div style="font-size:0.85rem;color:#6B7280;">
             Competitive Position
         </div>
         <div style="font-size:1.1rem;font-weight:600;line-height:1.4;">
+            Overall #{row['Competitive_Rank']}<br>
             AC #{row['AC_Rank']}<br>
-            NSC #{row['NSC_Rank']}<br>
-            Lives #{row['Lives_Rank']}
+            NSC #{row['NSC_Rank']}
         </div>
         """, unsafe_allow_html=True)
         st.caption(f"Top {pct_rank:.0f}% {labels['rank_context']}")
@@ -1128,11 +1305,11 @@ def render_executive_briefing(row, health_score, verdict, threats, forecast, df,
         <strong>Life AC</strong> = commission from life insurance production ·
         <strong>Life NSC</strong> = commission from new policies ·
         <strong>Lives</strong> = number of clients ·
-        <strong>Rank</strong> = position vs other NBO offices (#1 is best)
+        <strong>Overall Rank</strong> = weighted competitive position (#1 is best)
     </div>
     """, unsafe_allow_html=True)
     
-    rank_pct = 100 - (row['AC_Rank']/df.shape[0]*100) if df.shape[0] > 0 else 0
+    rank_pct = row.get('Competitive_Percentile', 0)
     ac_change = row['AC'] - row['AC_PY']
     change_word = "up" if ac_change >= 0 else "down"
 
@@ -1147,7 +1324,9 @@ def render_executive_briefing(row, health_score, verdict, threats, forecast, df,
             • <strong>{labels['ac_label']}:</strong> {format_peso(row['AC'])} ({change_word} {format_peso(abs(ac_change))} vs {labels['py_label']})<br>
             • <strong>{labels['nsc_label']}:</strong> {format_peso(row['NSC'])}<br>
             • <strong>{labels['lives_label']}:</strong> {row['Lives']:,.0f}<br>
-            • <strong>Rank:</strong> #{row['AC_Rank']} of {df.shape[0]} NBOs — top {rank_pct:.0f}% {labels['rank_context']}
+            • <strong>Overall Competitive Rank:</strong> #{row['Competitive_Rank']} of {df.shape[0]} NBOs — top {rank_pct:.0f}%<br>
+            • <strong>AC Rank:</strong> #{row['AC_Rank']} · <strong>NSC Rank:</strong> #{row['NSC_Rank']} · <strong>Lives Rank:</strong> #{row['Lives_Rank']}<br>
+            • <strong>Growth Rank:</strong> #{row['Growth_Rank']} · <strong>Target Rank:</strong> #{row['Target_Rank'] if row.get('Target_Rank') else 'N/A'}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1191,22 +1370,23 @@ def render_executive_briefing(row, health_score, verdict, threats, forecast, df,
     render_insight_card(nsc_icon, nsc_title, nsc_content, nsc_status,
                         "Life NSC measures commission from newly issued business — it signals future growth.")
 
-    if threats.get("gap_to_next", 0) > 0:
-        status, icon, title = "stable", "rocket", f"One rank away: #{row['AC_Rank'] - 1}"
+    # Updated threat insight using Competitive Rank
+    if threats.get("gap_to_next", 0) > 0 and threats.get("next_nbo"):
+        status, icon, title = "stable", "rocket", f"One rank away: Overall #{row['Competitive_Rank'] - 1}"
         content = f"""
-        <strong>You can move up one spot with focused effort.</strong><br><br>
-        • NBO ahead of you: <strong>{threats['next_nbo']}</strong> ({format_peso(threats['next_ac'])})<br>
-        • You need: <strong>{format_peso(threats['gap_to_next'])}</strong> more Life AC ({threats['opportunity_percent']:.1f}% increase)<br><br>
+        <strong>You can move up one overall rank with focused effort.</strong><br><br>
+        • NBO ahead of you: <strong>{threats['next_nbo']}</strong><br>
+        • You need: <strong>{format_peso(threats['gap_to_next'])}</strong> more Life AC ({threats['opportunity_percent']:.1f}% increase) to move from Overall Rank #{row['Competitive_Rank']} to #{row['Competitive_Rank'] - 1}<br><br>
         <strong>What to do:</strong> Target high-value cases and advisors closest to closing.
         """
-        explanation = "Closing this gap moves CENTURION TREE up one rank in the leaderboard."
+        explanation = "Closing this gap moves CENTURION TREE up one position in the overall competitive ranking."
     else:
-        status, icon, title = "strong", "emoji_events", "You hold the #1 rank"
+        status, icon, title = "strong", "emoji_events", "You hold the #1 overall rank"
         content = f"""
-        <strong>No other NBO has higher Life AC {labels['rank_context']}.</strong><br><br>
+        <strong>No other NBO has a better overall competitive ranking.</strong><br><br>
         Protect your lead by maintaining advisor activity and client retention.
         """
-        explanation = "AC Rank #1 means you lead the field for this reporting period."
+        explanation = "Overall Competitive Rank #1 means you lead the field for this reporting period."
     
     render_insight_card(icon, title, content, status, explanation)
 
@@ -1336,35 +1516,35 @@ def render_threat_monitor(threats, row):
         {render_icon('shield', size='lg', color='gold')}
         <h3 style="margin:0;">Threat Monitor</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">Competitive intelligence - who's ahead and who's behind</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">Competitive intelligence - who's ahead and who's behind overall</p>
     """, unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
     
     with col1:
-        if threats["gap_to_next"] > 0:
+        if threats["gap_to_next"] > 0 and threats.get("next_nbo"):
             render_callout(
                 "Opportunity to move up",
-                f"<strong>{threats['next_nbo']}</strong> is ahead of you with {format_peso(threats['next_ac'])} Life AC. "
-                f"You have {format_peso(row['AC'])}. You need {format_peso(threats['gap_to_next'])} more "
-                f"({threats['opportunity_percent']:.1f}% increase) to overtake them.",
+                f"<strong>{threats['next_nbo']}</strong> is ahead of you in the overall ranking. "
+                f"You need <strong>{format_peso(threats['gap_to_next'])}</strong> more Life AC "
+                f"({threats['opportunity_percent']:.1f}% increase) to move from Overall Rank #{row['Competitive_Rank']} to #{row['Competitive_Rank'] - 1}.",
                 "info",
             )
         else:
             render_callout(
                 "You hold the top spot",
-                "No other NBO has higher Life AC than you. Focus on maintaining and extending your lead.",
+                "No other NBO has a better overall competitive ranking. Focus on maintaining and extending your lead.",
                 "success",
             )
     
     with col2:
-        if threats["gap_to_prev"] > 0:
+        if threats["gap_to_prev"] > 0 and threats.get("prev_nbo"):
             threat_pct = safe_divide(threats["gap_to_prev"], row["AC"]) * 100
             if threat_pct < 5:
                 render_callout(
                     "High threat — competitor very close",
                     f"<strong>{threats['prev_nbo']}</strong> is only {format_peso(threats['gap_to_prev'])} "
-                    f"({threat_pct:.1f}%) behind you. Accelerate growth to protect your rank.",
+                    f"({threat_pct:.1f}%) behind you overall. Accelerate growth to protect your rank.",
                     "warning",
                 )
             elif threat_pct < 10:
@@ -1384,7 +1564,7 @@ def render_threat_monitor(threats, row):
         else:
             render_callout(
                 "No immediate threat from behind",
-                "No NBO is close behind you in the rankings. Focus on closing the gap to the next rank up.",
+                "No NBO is close behind you in the overall rankings. Focus on closing the gap to the next rank up.",
                 "info",
             )
 
@@ -1545,110 +1725,259 @@ def render_revenue_leakage(leakage, recovery, row):
             )
 
 def render_competitive_position(row, df):
+    """Updated to show all six ranks with Overall Competitive Rank as primary"""
     total = df.shape[0]
 
+    comp_rank = int(row["Competitive_Rank"])
     ac_rank = int(row["AC_Rank"])
     nsc_rank = int(row["NSC_Rank"])
     lives_rank = int(row["Lives_Rank"])
+    growth_rank = int(row["Growth_Rank"])
+    target_rank = int(row["Target_Rank"]) if row.get("Target_Rank") and pd.notna(row["Target_Rank"]) else None
 
-    ac_pct = ((total - ac_rank) / total) * 100 if total > 0 else 0
-    nsc_pct = ((total - nsc_rank) / total) * 100 if total > 0 else 0
-    lives_pct = ((total - lives_rank) / total) * 100 if total > 0 else 0
-    overall_pct = (ac_pct + nsc_pct + lives_pct) / 3
+    comp_pct = row.get("Competitive_Percentile", 0)
 
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
         {render_icon('emoji_events', size='lg', color='gold')}
         <h3 style="margin:0;">Competitive Position</h3>
     </div>
-    <p style="color:#6B7280; margin-bottom:1rem;">Rankings across AC, NSC, and Lives among all NBOs</p>
+    <p style="color:#6B7280; margin-bottom:1rem;">All rankings among {total} NBOs</p>
     """, unsafe_allow_html=True)
     
-    col1, col2, col3, col4 = st.columns(4)
+    # Show all six ranks in a 3x2 grid
+    col1, col2, col3 = st.columns(3)
+    col4, col5, col6 = st.columns(3)
+    
     with col1:
-        st.metric("AC Rank", f"#{ac_rank}", f"Top {ac_pct:.0f}%")
+        st.metric("🏆 Overall", f"#{comp_rank}", f"Top {comp_pct:.0f}%")
     with col2:
-        st.metric("NSC Rank", f"#{nsc_rank}", f"Top {nsc_pct:.0f}%")
+        st.metric("💰 AC", f"#{ac_rank}", f"of {total} NBOs")
     with col3:
-        st.metric("Lives Rank", f"#{lives_rank}", f"Top {lives_pct:.0f}%")
+        st.metric("📈 NSC", f"#{nsc_rank}", f"of {total} NBOs")
     with col4:
-        st.metric("Overall", f"Top {overall_pct:.0f}%", f"of {total} NBOs")
+        st.metric("👥 Lives", f"#{lives_rank}", f"of {total} NBOs")
+    with col5:
+        st.metric("🚀 Growth", f"#{growth_rank}", f"of {total} NBOs")
+    with col6:
+        target_display = f"#{target_rank}" if target_rank else "N/A"
+        st.metric("🎯 Target", target_display, f"of {total} NBOs" if target_rank else "YTD only")
     
-    chart_tabs = st.tabs(["🏆 AC Rank Ladder", "💰 NSC Rank Ladder", "👥 Lives Rank Ladder"])
-    
-    with chart_tabs[0]:
-        top_n = min(15, df.shape[0])
-        ladder_data = df.nsmallest(top_n, "AC_Rank")[["NBO", "AC", "AC_Rank"]].copy()
-        ladder_data["Color"] = ladder_data["NBO"].apply(
-            lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
-        
-        fig = go.Figure()
-        fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["AC"], orientation="h",
-                             marker_color=ladder_data["Color"],
-                             text=[format_peso(v) for v in ladder_data["AC"]], textposition="outside",
-                             hovertemplate="%{y}<br>AC: %{text}<br>Rank: %{customdata}<extra></extra>",
-                             customdata=ladder_data["AC_Rank"]))
-        fig.update_layout(title="AC Rank Ladder (Top 15)", xaxis_title="Life AC", yaxis_title="NBO",
-                          height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with chart_tabs[1]:
-        top_n = min(15, df.shape[0])
-        ladder_data = df.nsmallest(top_n, "NSC_Rank")[["NBO", "NSC", "NSC_Rank"]].copy()
-        ladder_data["Color"] = ladder_data["NBO"].apply(
-            lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
-        
-        fig = go.Figure()
-        fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["NSC"], orientation="h",
-                             marker_color=ladder_data["Color"],
-                             text=[format_peso(v) for v in ladder_data["NSC"]], textposition="outside",
-                             hovertemplate="%{y}<br>NSC: %{text}<br>Rank: %{customdata}<extra></extra>",
-                             customdata=ladder_data["NSC_Rank"]))
-        fig.update_layout(title="NSC Rank Ladder (Top 15)", xaxis_title="Life NSC", yaxis_title="NBO",
-                          height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with chart_tabs[2]:
-        top_n = min(15, df.shape[0])
-        ladder_data = df.nsmallest(top_n, "Lives_Rank")[["NBO", "Lives", "Lives_Rank"]].copy()
-        ladder_data["Color"] = ladder_data["NBO"].apply(
-            lambda x: SUN_LIFE_GOLD if "CENTURION" in str(x).upper() else "#6B7280")
-        
-        fig = go.Figure()
-        fig.add_trace(go.Bar(y=ladder_data["NBO"], x=ladder_data["Lives"], orientation="h",
-                             marker_color=ladder_data["Color"],
-                             text=[f"{v:,.0f}" for v in ladder_data["Lives"]], textposition="outside",
-                             hovertemplate="%{y}<br>Lives: %{text}<br>Rank: %{customdata}<extra></extra>",
-                             customdata=ladder_data["Lives_Rank"]))
-        fig.update_layout(title="Lives Rank Ladder (Top 15)", xaxis_title="Lives", yaxis_title="NBO",
-                          height=400, template="plotly_white", margin=dict(l=0, r=50, t=50, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-    
-    if ac_rank == 1:
-        rank_insight = "🏆 You're the #1 performer in AC!"
-    elif ac_rank <= 3:
-        rank_insight = f"🥇 You're in the Top 3 for AC (Rank #{ac_rank})"
-    elif ac_rank <= 10:
-        rank_insight = f"⭐ You're in the Top 10 for AC (Rank #{ac_rank})"
-    else:
-        next_rank_ac = df[df["AC_Rank"] < ac_rank].iloc[-1]["AC"] if ac_rank > 1 else 0
-        gap = next_rank_ac - row["AC"] if ac_rank > 1 else 0
-        rank_insight = f"Need +{format_peso(gap)} more AC to move up one rank" if ac_rank > 1 else "🏆 You're the #1 performer!"
-    
+    # Position Summary
     st.markdown(f"""
-    <div class="insight-box gold-border">
+    <div class="insight-box gold-border" style="margin-top:1rem;">
         <div style="display:flex; align-items:center; gap:0.5rem;">
             {render_icon('analytics', size='md', color='gold')}
             <span class="insight-title">Position Summary</span>
         </div>
         <div class="insight-content">
-            <strong>🏆 AC Rank:</strong> #{ac_rank} of {total} NBOs · Top {ac_pct:.0f}%<br>
-            <strong>💰 NSC Rank:</strong> #{nsc_rank} of {total} NBOs · Top {nsc_pct:.0f}%<br>
-            <strong>👥 Lives Rank:</strong> #{lives_rank} of {total} NBOs · Top {lives_pct:.0f}%<br><br>
-            <strong>{rank_insight}</strong>
+            <strong>🏆 Overall Competitive Rank:</strong> #{comp_rank} of {total} NBOs · Top {comp_pct:.0f}%<br>
+            <strong>💰 AC Rank:</strong> #{ac_rank} of {total} NBOs<br>
+            <strong>📈 NSC Rank:</strong> #{nsc_rank} of {total} NBOs<br>
+            <strong>👥 Lives Rank:</strong> #{lives_rank} of {total} NBOs<br>
+            <strong>🚀 Growth Rank:</strong> #{growth_rank} of {total} NBOs<br>
+            <strong>🎯 Target Rank:</strong> {f'#{target_rank} of {total} NBOs' if target_rank else 'N/A (YTD only)'}
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+def render_rankings_page(df, report_type, centurion_row):
+    """New Rankings page with all leaderboards - COMPLETELY FIXED DISPLAY"""
+    st.markdown(f"""
+    <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:1rem;">
+        {render_icon('leaderboard', size='xl', color='gold')}
+        <h2 style="margin:0;">🏆 Rankings Leaderboard</h2>
+        <span class="data-source-badge">{report_type}</span>
+    </div>
+    <p style="color:#6B7280; margin-bottom:1.5rem;">
+        Complete rankings of all {len(df)} NBOs. CENTURION TREE is highlighted in gold.
+    </p>
+    """, unsafe_allow_html=True)
+    
+    # Create tabs for each ranking type
+    tabs = st.tabs([
+        "🏆 Overall Rankings",
+        "💰 AC Rankings", 
+        "📈 NSC Rankings",
+        "👥 Lives Rankings",
+        "🚀 Growth Rankings",
+        "🎯 % to Target Rankings"
+    ])
+    
+    # Create a completely clean DataFrame with ONLY the data we need
+    # This avoids any pandas metadata contamination
+    clean_data = []
+    
+    for idx, row in df.iterrows():
+        # Get clean values
+        nbo = str(row["NBO"])
+        ac = float(row["AC"]) if pd.notna(row["AC"]) else 0
+        nsc = float(row["NSC"]) if pd.notna(row["NSC"]) else 0
+        lives = float(row["Lives"]) if pd.notna(row["Lives"]) else 0
+        
+        # Get ranks
+        comp_rank = int(row["Competitive_Rank"]) if pd.notna(row["Competitive_Rank"]) else 0
+        ac_rank = int(row["AC_Rank"]) if pd.notna(row["AC_Rank"]) else 0
+        nsc_rank = int(row["NSC_Rank"]) if pd.notna(row["NSC_Rank"]) else 0
+        lives_rank = int(row["Lives_Rank"]) if pd.notna(row["Lives_Rank"]) else 0
+        growth_rank = int(row["Growth_Rank"]) if pd.notna(row["Growth_Rank"]) else 0
+        
+        # Target data
+        pct_target = float(row["Pct_Target"]) if pd.notna(row.get("Pct_Target")) and row.get("Pct_Target") is not None else 0
+        target_rank = int(row["Target_Rank"]) if pd.notna(row.get("Target_Rank")) and row.get("Target_Rank") is not None else 0
+        
+        # Add star to CENTURION
+        if "CENTURION" in nbo.upper():
+            nbo_display = f"⭐ {nbo}"
+        else:
+            nbo_display = nbo
+        
+        clean_data.append({
+            "NBO": nbo,
+            "NBO_Display": nbo_display,
+            "AC": ac,
+            "NSC": nsc,
+            "Lives": lives,
+            "Competitive_Rank": comp_rank,
+            "AC_Rank": ac_rank,
+            "NSC_Rank": nsc_rank,
+            "Lives_Rank": lives_rank,
+            "Growth_Rank": growth_rank,
+            "Pct_Target": pct_target,
+            "Target_Rank": target_rank,
+            "is_centurion": "CENTURION" in nbo.upper()
+        })
+    
+    clean_df = pd.DataFrame(clean_data)
+    
+    # Overall Rankings
+    with tabs[0]:
+        st.subheader("Overall Competitive Rankings")
+        st.caption(f"Sorted by Overall Competitive Rank — {len(clean_df)} NBOs")
+        sorted_df = clean_df.sort_values("Competitive_Rank")
+        _render_ranking_table_safe(sorted_df, "Competitive_Rank", report_type)
+    
+    # AC Rankings
+    with tabs[1]:
+        st.subheader("AC Rankings")
+        st.caption(f"Sorted by Life AC — {len(clean_df)} NBOs")
+        sorted_df = clean_df.sort_values("AC_Rank")
+        _render_ranking_table_safe(sorted_df, "AC_Rank", report_type)
+    
+    # NSC Rankings
+    with tabs[2]:
+        st.subheader("NSC Rankings")
+        st.caption(f"Sorted by Life NSC — {len(clean_df)} NBOs")
+        sorted_df = clean_df.sort_values("NSC_Rank")
+        _render_ranking_table_safe(sorted_df, "NSC_Rank", report_type)
+    
+    # Lives Rankings
+    with tabs[3]:
+        st.subheader("Lives Rankings")
+        st.caption(f"Sorted by Lives — {len(clean_df)} NBOs")
+        sorted_df = clean_df.sort_values("Lives_Rank")
+        _render_ranking_table_safe(sorted_df, "Lives_Rank", report_type)
+    
+    # Growth Rankings
+    with tabs[4]:
+        st.subheader("Growth Rankings")
+        st.caption(f"Sorted by Growth Score — {len(clean_df)} NBOs")
+        sorted_df = clean_df.sort_values("Growth_Rank")
+        _render_ranking_table_safe(sorted_df, "Growth_Rank", report_type)
+    
+    # Target Rankings (only if available)
+    with tabs[5]:
+        st.subheader("% to Target Rankings")
+        if report_type == "YTD" and "Target_Rank" in clean_df.columns:
+            st.caption(f"Sorted by % to Target — {len(clean_df)} NBOs")
+            sorted_df = clean_df.sort_values("Target_Rank")
+            _render_ranking_table_safe(sorted_df, "Target_Rank", report_type)
+        else:
+            st.info("📊 Target rankings are only available in YTD reports. Upload a YTD file to see target rankings.")
+
+def _render_ranking_table_safe(sorted_df, rank_column, report_type):
+    """SAFE version: Render a ranking table with clean values - NO metadata"""
+    
+    # Rank column label
+    rank_label = {
+        "Competitive_Rank": "Overall",
+        "AC_Rank": "AC",
+        "NSC_Rank": "NSC",
+        "Lives_Rank": "Lives",
+        "Growth_Rank": "Growth",
+        "Target_Rank": "Target"
+    }.get(rank_column, "Rank")
+    
+    # Build HTML table
+    html = '<div class="leaderboard-container"><table class="ranking-table">'
+    
+    # Header
+    html += '<thead><tr>'
+    html += f'<th>{rank_label}</th>'
+    html += '<th>NBO</th>'
+    html += '<th>AC</th>'
+    html += '<th>NSC</th>'
+    html += '<th>Lives</th>'
+    html += '<th>Growth Rank</th>'
+    if report_type == "YTD":
+        html += '<th>% to Target</th>'
+        html += '<th>Target Rank</th>'
+    html += '</tr></thead>'
+    
+    # Body
+    html += '<tbody>'
+    
+    for idx, row in sorted_df.iterrows():
+        is_centurion = row["is_centurion"]
+        row_class = 'centurion-row' if is_centurion else ''
+        html += f'<tr class="{row_class}">'
+        
+        # Rank column
+        rank_val = int(row[rank_column])
+        if is_centurion:
+            html += f'<td class="rank-number centurion-rank">#{rank_val}</td>'
+        else:
+            html += f'<td class="rank-number">#{rank_val}</td>'
+        
+        # NBO
+        html += f'<td>{row["NBO_Display"]}</td>'
+        
+        # AC
+        html += f'<td>{format_peso(row["AC"])}</td>'
+        
+        # NSC
+        html += f'<td>{format_peso(row["NSC"])}</td>'
+        
+        # Lives
+        html += f'<td>{int(row["Lives"]):,}</td>'
+        
+        # Growth Rank
+        html += f'<td>#{int(row["Growth_Rank"])}</td>'
+        
+        # Target columns for YTD
+        if report_type == "YTD":
+            if row["Pct_Target"] > 0:
+                html += f'<td>{row["Pct_Target"]:.1f}%</td>'
+            else:
+                html += '<td>—</td>'
+            
+            if row["Target_Rank"] > 0:
+                html += f'<td>#{int(row["Target_Rank"])}</td>'
+            else:
+                html += '<td>—</td>'
+        
+        html += '</tr>'
+    
+    html += '</tbody></table></div>'
+    
+    st.markdown(html, unsafe_allow_html=True)
+    
+    # Show CENTURION position
+    centurion_rows = sorted_df[sorted_df["is_centurion"]]
+    if not centurion_rows.empty:
+        centurion_row = centurion_rows.iloc[0]
+        rank_val = int(centurion_row[rank_column])
+        st.caption(f"⭐ CENTURION TREE is highlighted in gold — Rank #{rank_val}")
 
 def render_management_actions(row, threats, forecast, health_score, data_source):
     st.markdown(f"""
@@ -1679,14 +2008,14 @@ def render_management_actions(row, threats, forecast, health_score, data_source)
         actions.append({
             "priority": "HIGH",
             "action": f"🛡️ Defend Position from {threats['prev_nbo']}",
-            "details": f"Competitor is only {format_peso(threats['gap_to_prev'])} behind. Increase productivity and accelerate growth to maintain your lead."
+            "details": f"Competitor is only {format_peso(threats['gap_to_prev'])} behind overall. Increase productivity and accelerate growth to maintain your lead."
         })
     
     if threats.get("opportunity_value", 0) > 0:
         actions.append({
             "priority": "HIGH",
             "action": f"🎯 Overtake {threats['next_nbo']}",
-            "details": f"Need +{threats['opportunity_percent']:.1f}% growth to pass {threats['next_nbo']}. Focus on competitive advantages and key opportunities."
+            "details": f"Need +{threats['opportunity_percent']:.1f}% growth to pass {threats['next_nbo']} overall. Focus on competitive advantages and key opportunities."
         })
     
     if has_target_data(row) and forecast.get("gap_to_target", 0) > 0:
@@ -1756,16 +2085,19 @@ def main():
         
         with st.expander("How Metrics Work"):
             st.markdown("""
-            **Health Score** (0-100) — overall performance at a glance
+            **Health Score** (0-100) — overall performance at a glance (unchanged)
             
-            **YTD and MTD use the same PER NBO sheet layout.**  
-            YTD files include columns N (Annual Life AC Target) and O (% to target).
+            **Competitive Ranking** — weighted position across all NBOs
+            - **YTD:** AC (25%), NSC (20%), Lives (15%), Growth (20%), Target (20%)
+            - **MTD:** AC (35%), NSC (25%), Lives (20%), Growth (20%)
             
             **Terms:**
             - **Life AC** — total life insurance commission
             - **Life NSC** — commission from new policies
             - **Lives** — number of clients
-            - **Rank** — position vs other NBOs (#1 is best)
+            - **Overall Rank** — weighted competitive position (#1 is best)
+            - **Growth Rank** — based on average of AC, NSC, and Lives growth
+            - **Target Rank** — based on % to Target (YTD only)
             """)
         
         st.caption("Powered by Sun Life Data Analytics")
@@ -1816,10 +2148,12 @@ def main():
         3. Upload **both** to compare this month vs your monthly average
         
         ### What You'll See
-        - **Health Score** — one number summarizing performance
+        - **Health Score** — one number summarizing performance (unchanged)
+        - **Competitive Rankings** — overall, AC, NSC, Lives, Growth, Target
         - **Executive Briefing** — plain-English insights for leadership
-        - **Threat Monitor** — who is ahead or behind you
+        - **Threat Monitor** — who is ahead or behind you overall
         - **Action Center** — prioritized next steps
+        - **Leaderboard** — complete rankings of all NBOs
         """)
         return
 
@@ -1846,9 +2180,12 @@ def main():
 
     include_target = has_target_data(row)
 
+    # Health Score - UNCHANGED
     health_score = calculate_health_score(row, df, include_target=include_target)
     health_data = calculate_health_score_components(row, df, include_target=include_target)
     verdict = determine_verdict(health_score)
+    
+    # Threat metrics - UPDATED to use Competitive_Rank
     threats = calculate_threat_metrics(row, df)
     forecast = calculate_forecast(row)
     leakage, recovery = calculate_revenue_leakage(row)
@@ -1867,7 +2204,8 @@ def main():
         "📊 Case Size",
         "💰 Revenue",
         "🏆 Position",
-        "🎯 Actions"
+        "🎯 Actions",
+        "🏆 Rankings"
     ])
     
     with tabs[0]:
@@ -1890,6 +2228,9 @@ def main():
     
     with tabs[6]:
         render_management_actions(row, threats, forecast, health_score, data_source)
+    
+    with tabs[7]:
+        render_rankings_page(df, data_source, row)
     
     if ytd_ready and mtd_ready and centurion_ytd is not None and centurion_mtd is not None:
         st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
